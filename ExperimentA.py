@@ -595,6 +595,7 @@ ALGOS        = ["cql", "dt"]    #["cql", "dt", "cdt"]
 
 
 def run_single(algo, noise, seed, dataset_id, device, dt_steps, cql_steps):
+    print("Experiment A")
     print(f"\n{'─'*55}")
     print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}")
     print(f"{'─'*55}")
