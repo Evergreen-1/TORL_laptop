@@ -297,7 +297,7 @@ def normalize_states(obs: np.ndarray, mean, std):
 
 def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> float:
     import torch
-    from CQL.cql import (
+    from cql import (
         TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
     )
 
@@ -371,7 +371,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     import torch
     import torch.nn as nn
     from torch.nn import functional as F
-    from DT.dt import DecisionTransformer, pad_along_axis
+    from dt import DecisionTransformer, pad_along_axis
 
     set_seed(seed)
 
@@ -472,12 +472,13 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                 # Write back utilizing exact device targets
                 actions[0, step]   = torch.as_tensor(act, dtype=torch.float32, device=device)
                 states[0, step+1]  = torch.as_tensor(obs, dtype=torch.float32, device=device)
-                returns[0, step+1] = returns[0, step] - reward
+
+                returns[0, step+1] = returns[0, step] - (reward * reward_scale)
                 
                 ep_ret += reward
                 if terminated or truncated:
                     break
-            rets.append(ep_ret / reward_scale)
+            rets.append(ep_ret)
         model.train()
         return float(np.mean(rets))
 
@@ -524,7 +525,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> 
     needs wiring once the OSRL dependency is confirmed on your system.
     """
     import torch
-    from CDT.cdt import CDT, CDTTrainer
+    from cdt import CDT, CDTTrainer
 
     set_seed(seed)
     state_dim  = env.observation_space.shape[0]
