@@ -29,6 +29,8 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import wandb
+
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -353,12 +355,15 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
 
     for t in range(max_steps):
         batch = [b.to(device) for b in buf.sample(256)]
-        trainer.train(batch)
+        log_cql = trainer.train(batch)
+        if log_cql and isinstance(log_cql, dict):
+            wandb.log({f"train/{k}": v for k, v in log_cql.items()}, step=t)
         if (t + 1) % eval_freq == 0:
             raw = eval_gymnasium(actor_fn, eval_env, n_episodes=10, seed=seed, device=device)
             norm = get_normalized_score(raw)
             print(f"  [CQL] step {t+1:>7,}  norm_score={norm:.2f}")
             best_score = max(best_score, norm)
+            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=t)
 
     return best_score
 
@@ -506,11 +511,14 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
         optim.step()
         scheduler.step()
 
+        wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
+
         if (step + 1) % eval_freq == 0:
             raw  = eval_dt()
             norm = get_normalized_score(raw)
             print(f"  [DT]  step {step+1:>7,}  norm_score={norm:.2f}")
             best_score = max(best_score, norm)
+            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
         
     return best_score
 
@@ -600,6 +608,26 @@ def run_single(algo, noise, seed, dataset_id, device, dt_steps, cql_steps):
     print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}")
     print(f"{'─'*55}")
 
+    try:
+        if cql_steps is not None:
+            steps = cql_steps
+        elif dt_steps is not None:
+            steps = dt_steps
+    except Exception as e:
+        print("Error: "+ e)
+    
+    if wandb.run is not None:
+        wandb.finish()
+    
+    wandb.init(project = "Experiment-A",
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}",
+               config ={"algo": algo,
+                        "noise_level": noise,
+                        "seed": seed,
+                        "dataset_id": dataset_id,
+                        "device:": device,
+                        "steps": steps})
+
     flat, env, trajs = load_minari_dataset(dataset_id)
 
     noisy_flat  = inject_gaussian_noise(flat,  noise, seed)
@@ -613,6 +641,7 @@ def run_single(algo, noise, seed, dataset_id, device, dt_steps, cql_steps):
         score = run_cdt(noisy_trajs, env, seed, device, dt_steps)
 
     log_result(algo, noise, seed, score)
+    wandb.finish()
     return score
 
 
