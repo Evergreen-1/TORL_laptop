@@ -27,10 +27,29 @@ import random
 import sys
 from collections import defaultdict
 
+#general algo + logging
 import numpy as np
 import torch
 import wandb
 
+#dataset
+import minari
+import gymnasium as gym
+
+#run dt
+import torch.nn as nn
+from torch.nn import functional as F
+from dt import DecisionTransformer, pad_along_axis
+from tqdm import trange
+
+#device specs
+import torch_directml
+
+#cql
+from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
+
+#cdt
+from cdt import CDT, CDTTrainer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -46,7 +65,7 @@ def get_device(requested: str = "auto"):
     All .to(device) calls in the pipeline accept both strings and device objects.
     """
     if requested == "directml":
-        import torch_directml
+        
         if torch_directml.is_available():
             print(f"[Device] DirectML: {torch_directml.device()}")
             return torch_directml.device()
@@ -57,7 +76,6 @@ def get_device(requested: str = "auto"):
     if requested == "auto":
         # Try DirectML first on Windows, then CUDA, then CPU
         try:
-            import torch_directml
             if torch_directml.is_available():
                 print(f"[Device] Auto-selected DirectML")
                 return torch_directml.device()
@@ -134,7 +152,7 @@ def load_minari_dataset(dataset_id: str):
       env           – a live gymnasium env recovered from the dataset
       traj_list     – list of per-episode dicts (for DT/CDT sequence models)
     """
-    import minari
+
 
     print(f"[Minari] Loading '{dataset_id}' ...")
     try:
@@ -298,10 +316,6 @@ def normalize_states(obs: np.ndarray, mean, std):
 # ══════════════════════════════════════════════════════════════
 
 def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> float:
-    import torch
-    from cql import (
-        TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
-    )
 
     set_seed(seed, env)
 
@@ -316,7 +330,6 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
     ds["next_observations"] = normalize_states(ds["next_observations"], state_mean, state_std)
 
     # Eval env with same normalisation applied via wrapper
-    import gymnasium as gym
 
     class NormWrapper(gym.ObservationWrapper):
         def observation(self, obs):
@@ -373,12 +386,9 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
 # ══════════════════════════════════════════════════════════════
 
 def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
-    import torch
-    import torch.nn as nn
-    from torch.nn import functional as F
-    from dt import DecisionTransformer, pad_along_axis
 
     set_seed(seed)
+
 
     all_obs    = np.concatenate([t["observations"] for t in traj_list])
     state_mean = all_obs.mean(0, keepdims=True)
@@ -392,21 +402,26 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     def sample_batch(batch_size):
         S, A, R, T, M = [], [], [], [], []
         for _ in range(batch_size):
-            idx   = np.random.choice(len(traj_list), p=sample_prob)
-            traj  = traj_list[idx]
-            start = random.randint(0, len(traj["rewards"]) - 1)
-            s = (traj["observations"][start:start + seq_len] - state_mean) / state_std
-            a = traj["actions"][start:start + seq_len]
-            r = traj["returns"][start:start + seq_len] * reward_scale
-            t = np.arange(start, start + seq_len)
-            mask = np.hstack([np.ones(s.shape[0]), np.zeros(seq_len - s.shape[0])])
-            if s.shape[0] < seq_len:
-                s = pad_along_axis(s, seq_len)
-                a = pad_along_axis(a, seq_len)
-                r = pad_along_axis(r, seq_len)
-            S.append(s); A.append(a); R.append(r); T.append(t); M.append(mask)
+            traj_idx = np.random.choice(len(traj_list), p=sample_prob)
+            traj     = traj_list[traj_idx]
+            start_idx = random.randint(0, traj["rewards"].shape[0] - 1)
+            
+            states = traj["observations"][start_idx : start_idx + seq_len]
+            actions = traj["actions"][start_idx : start_idx + seq_len]
+            returns = traj["returns"][start_idx : start_idx + seq_len]
+            time_steps = np.arange(start_idx, start_idx + seq_len)
+
+            states = (states - state_mean) / state_std
+            returns = returns * reward_scale
+            
+            mask = np.hstack([np.ones(states.shape[0]), np.zeros(seq_len - states.shape[0])])
+            if states.shape[0] < seq_len:
+                states = pad_along_axis(states, pad_to=seq_len)
+                actions = pad_along_axis(actions, pad_to=seq_len)
+                returns = pad_along_axis(returns, pad_to=seq_len)
+                
+            S.append(states); A.append(actions); R.append(returns); T.append(time_steps); M.append(mask)
         
-        # Convert to tensor directly on target device
         return (
             torch.tensor(np.stack(S), dtype=torch.float32, device=device),
             torch.tensor(np.stack(A), dtype=torch.float32, device=device),
@@ -429,81 +444,73 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     optim     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lambda s: min((s + 1) / 10_000, 1))
 
-    target_return = 3_000.0 * reward_scale
-    eval_freq     = max(update_steps // 10, 10)
-    best_score    = -np.inf
+    eval_freq      = max(update_steps // 10, 10_000)
+    target_returns = (4500.0, 2250.0)  # Standard D4RL testing intervals mapped to Walker2d scale
+    best_score     = -np.inf
 
-    import gymnasium as gym
-
-    class NormWrapper(gym.ObservationWrapper):
+    class NormObservation(gym.ObservationWrapper):
         def observation(self, obs):
             return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
 
-    eval_env = NormWrapper(env)
+    class ScaleReward(gym.RewardWrapper):
+        def reward(self, reward):
+            return reward * reward_scale
 
-    def eval_dt(n_episodes=10):
-        model.eval()
-        rets = []
-        for ep_i in range(n_episodes):
-            obs, _ = eval_env.reset(seed=seed + ep_i)
+    eval_env = NormObservation(env)
+    eval_env = ScaleReward(eval_env)
+
+    @torch.no_grad()
+    def clean_eval_rollout(target_return: float, eval_seed: int):
+        states = torch.zeros(1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device)
+        actions = torch.zeros(1, model.episode_len, model.action_dim, dtype=torch.float, device=device)
+        returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
+        time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device).view(1, -1)
+
+        obs, _ = eval_env.reset(seed=eval_seed)
+        states[:, 0] = torch.as_tensor(obs, device=device)
+        returns[:, 0] = torch.as_tensor(target_return, device=device)
+
+        episode_return, episode_len = 0.0, 0.0
+        for step in range(model.episode_len):
+            predicted_actions = model(
+                states[:, : step + 1][:, -model.seq_len :],
+                actions[:, : step + 1][:, -model.seq_len :],
+                returns[:, : step + 1][:, -model.seq_len :],
+                time_steps[:, : step + 1][:, -model.seq_len :],
+            )
+            predicted_action = predicted_actions[0, -1].cpu().numpy()
             
-            # Explicitly force variables to live strictly on the chosen device
-            states    = torch.zeros(1, 1001, state_dim,  dtype=torch.float32, device=device)
-            actions   = torch.zeros(1, 1000, action_dim, dtype=torch.float32, device=device)
-            returns   = torch.zeros(1, 1001,              dtype=torch.float32, device=device)
-            timesteps = torch.arange(1000, dtype=torch.long, device=device).unsqueeze(0)
+            next_state, reward, terminated, truncated, _ = eval_env.step(predicted_action)
+            done = terminated or truncated
+            
+            actions[:, step] = torch.as_tensor(predicted_action)
+            states[:, step + 1] = torch.as_tensor(next_state)
+            returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
 
-            states[0, 0]  = torch.as_tensor(obs, dtype=torch.float32, device=device)
-            returns[0, 0] = target_return
+            episode_return += reward
+            episode_len += 1
+            if done:
+                break
 
-            ep_ret, done = 0.0, False
-            for step in range(1000):
-                # Ensure the slicing output retains device registration explicitly
-                s_input = states[:, :step+1][:, -seq_len:].to(device)
-                a_input = actions[:, :step+1][:, -seq_len:].to(device)
-                r_input = returns[:, :step+1][:, -seq_len:].to(device)
-                t_input = timesteps[:, :step+1][:, -seq_len:].to(device)
-
-                pred = model(
-                    states=s_input,
-                    actions=a_input,
-                    returns_to_go=r_input,
-                    time_steps=t_input,
-                )
-                
-                act = pred[0, -1].clamp(-max_action, max_action).cpu().detach().numpy()
-                obs, reward, terminated, truncated, _ = eval_env.step(act)
-                
-                # Write back utilizing exact device targets
-                actions[0, step]   = torch.as_tensor(act, dtype=torch.float32, device=device)
-                states[0, step+1]  = torch.as_tensor(obs, dtype=torch.float32, device=device)
-
-                returns[0, step+1] = returns[0, step] - (reward * reward_scale)
-                
-                ep_ret += reward
-                if terminated or truncated:
-                    break
-            rets.append(ep_ret)
-        model.train()
-        return float(np.mean(rets))
+        return episode_return, episode_len
 
     model.train()
-    from tqdm import trange
     for step in trange(update_steps, desc="DT Training"):
-        states, actions, returns, timesteps, mask = sample_batch(64)
-        
-        # Ensure padding mask calculation is directly on-device
-        padding_mask = (~mask.to(torch.bool)).to(device)
+        batch = sample_batch(64)
+        states, actions, returns, time_steps, mask = [b.to(device) for b in batch]
+        padding_mask = ~mask.to(torch.bool)
 
-        pred = model(
-            states=states, 
-            actions=actions, 
+        predicted_actions = model(
+            states=states,
+            actions=actions,
             returns_to_go=returns,
-            time_steps=timesteps, 
-            padding_mask=padding_mask
+            time_steps=time_steps,
+            padding_mask=padding_mask,
         )
         
-        loss = (F.mse_loss(pred, actions.detach(), reduction="none") * mask.unsqueeze(-1)).mean()
+        # Loss calculation identical to line 290 in clean template
+        loss = F.mse_loss(predicted_actions, actions.detach(), reduction="none")
+        loss = (loss * mask.unsqueeze(-1)).mean()
         
         optim.zero_grad()
         loss.backward()
@@ -513,12 +520,34 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
 
         wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
 
-        if (step + 1) % eval_freq == 0:
-            raw  = eval_dt()
-            norm = get_normalized_score(raw)
-            print(f"  [DT]  step {step+1:>7,}  norm_score={norm:.2f}")
-            best_score = max(best_score, norm)
-            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
+        # Evaluation phase execution logic built out from TrainConfig steps
+        if step % eval_freq == 0 or step == update_steps - 1:
+            model.eval()
+            for target_return in target_returns:
+                eval_returns = []
+                for ep_i in range(10):  # Performs standard batch trajectory evaluation
+                    eval_return, _ = clean_eval_rollout(
+                        target_return=target_return * reward_scale, 
+                        eval_seed=seed + ep_i
+                    )
+                    # Unscale raw rewards exactly like line 324 in clean script
+                    eval_returns.append(eval_return / reward_scale)
+                
+                mean_raw_return = float(np.mean(eval_returns))
+                norm = get_normalized_score(mean_raw_return)
+                
+                if target_return == 4500.0:
+                    best_score = max(best_score, norm)
+                    print(f"  [DT]  step {step+1:>7,}  target={target_return}  norm_score={norm:.2f}")
+
+                wandb.log(
+                    {
+                        f"eval/{target_return}_return_mean": mean_raw_return,
+                        f"eval/{target_return}_normalized_score_mean": norm,
+                    },
+                    step=step,
+                )
+            model.train()
         
     return best_score
 
@@ -532,8 +561,6 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> 
     CDT stub. Model instantiation works; the train_one_step batch loop
     needs wiring once the OSRL dependency is confirmed on your system.
     """
-    import torch
-    from cdt import CDT, CDTTrainer
 
     set_seed(seed)
     state_dim  = env.observation_space.shape[0]
