@@ -431,3 +431,6 @@ FodyWeavers.xsd
 #wandb
 wandb/
 *.csv
+
+#venv
+cql_venv/
