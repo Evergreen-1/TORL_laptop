@@ -43,13 +43,13 @@ from dt import DecisionTransformer, pad_along_axis
 from tqdm import trange
 
 #device specs
-import torch_directml
+#import torch_directml
 
 #cql
 from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
 
 #cdt
-from cdt import CDT, CDTTrainer
+#from cdt import CDT, CDTTrainer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -103,7 +103,7 @@ def get_args():
     parser.add_argument("--noise",     type=float, default=0.0)
     parser.add_argument("--seed",      type=int,   default=0)
     parser.add_argument("--device",    type=str,   default="cpu")
-    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0")
+    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/expert-v0") #mujoco/walker2d/medium-v0
     parser.add_argument("--dt_steps",  type=int,   default=100_000)
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
     parser.add_argument("--full",      action="store_true")
@@ -132,7 +132,7 @@ def set_seed(seed: int, env=None):
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
 # These are fixed constants — no D4RL install needed.
 WALKER2D_REF_MIN = 1.629      # average return of random policy
-WALKER2D_REF_MAX = 4592.3     # average return of expert policy
+WALKER2D_REF_MAX = 4592.3     # average return of expert policy #6992.717
 
 def get_normalized_score(raw_return: float) -> float:
     """
@@ -366,7 +366,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
     eval_freq  = max(max_steps // 20, 5_000)
     best_score = -np.inf
 
-    for t in range(max_steps):
+    for t in trange(max_steps, desc="CQL Training"):
         batch = [b.to(device) for b in buf.sample(256)]
         log_cql = trainer.train(batch)
         if log_cql and isinstance(log_cql, dict):
