@@ -1,23 +1,15 @@
 """
-Experiment A Pipeline - Joshua
-===============================
-Minari edition — works on Windows, Linux, and macOS.
-No D4RL, no mujoco-py, no legacy gym required.
+Experiment A - Joshua
 
 Dataset:  mujoco/walker2d/medium-v0  (Minari)
-Env:      Walker2d-v4                (gymnasium + mujoco)
+Env:      Walker2d-v5                (gymnasium + mujoco)
 Algos:    DT, CQL, CDT
 Noise:    0%, 25%, 50%, 75% Gaussian injection
 Seeds:    [0, 1, 2, 3, 4]
-Metric:   D4RL-equivalent normalised score (mean ± std over 5 seeds)
-
-AMD RX 6600 XT (Windows):
-  PyTorch does NOT support ROCm on Windows. Use --device cpu on Windows,
-  or run in WSL2 with ROCm installed there instead.
 
 Usage:
-  python experiment_a_pipeline.py --algo dt --noise 0.0 --seed 0
-  python experiment_a_pipeline.py --full
+  python ExperimentA.py --algo dt --device cuda --noise 0.0 --seed 0 --dt_steps 100000
+  python ExperimentA.py --full
 """
 
 import argparse
@@ -31,6 +23,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import wandb
+import torch_directml
 
 #dataset
 import minari
@@ -54,10 +47,7 @@ from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, Repl
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-
-# ══════════════════════════════════════════════════════════════
 # DEVICE DETECTION
-# ══════════════════════════════════════════════════════════════
 
 def get_device(requested: str = "auto"):
     """
@@ -93,9 +83,7 @@ def get_device(requested: str = "auto"):
     return requested  # explicit "cpu" or "cuda" passed by user
 
 
-# ══════════════════════════════════════════════════════════════
 # ARGUMENT PARSING
-# ══════════════════════════════════════════════════════════════
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -106,13 +94,13 @@ def get_args():
     parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/expert-v0") #mujoco/walker2d/medium-v0
     parser.add_argument("--dt_steps",  type=int,   default=100_000)
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
+    parser.add_argument("--steps", type=int,   default=100_000)
     parser.add_argument("--full",      action="store_true")
     return parser.parse_args()
 
 
-# ══════════════════════════════════════════════════════════════
-# SEED MANAGEMENT
-# ══════════════════════════════════════════════════════════════
+
+# SEED MANAGEMENT (similar to dt set seed)
 
 def set_seed(seed: int, env=None):
     random.seed(seed)
@@ -124,20 +112,16 @@ def set_seed(seed: int, env=None):
         env.reset(seed=seed)   # gymnasium API uses reset(seed=) not env.seed()
         env.action_space.seed(seed)
 
-
-# ══════════════════════════════════════════════════════════════
 # STEP 2 — DATASET LOADING (Minari)
-# ══════════════════════════════════════════════════════════════
 
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
-# These are fixed constants — no D4RL install needed.
+# These are fixed constants
 WALKER2D_REF_MIN = 1.629      # average return of random policy
 WALKER2D_REF_MAX = 4592.3     # average return of expert policy #6992.717
 
 def get_normalized_score(raw_return: float) -> float:
     """
-    D4RL-equivalent normalised score, computed manually.
-    Replaces env.get_normalized_score() from the old d4rl library.
+    D4RL-equivalent normalised score,
     Returns a value in roughly [0, 100], where 100 = expert level.
     """
     return 100.0 * (raw_return - WALKER2D_REF_MIN) / (WALKER2D_REF_MAX - WALKER2D_REF_MIN)
@@ -147,10 +131,10 @@ def load_minari_dataset(dataset_id: str):
     """
     Downloads (first run) and loads a Minari dataset.
     Returns:
-      dataset_dict  – flat dict with keys matching D4RL format:
+      dataset_dict   -flat dict with keys matching D4RL format:
                       observations, actions, rewards, next_observations, terminals
-      env           – a live gymnasium env recovered from the dataset
-      traj_list     – list of per-episode dicts (for DT/CDT sequence models)
+      env            -a live gymnasium env recovered from the dataset
+      traj_list      -list of per-episode dicts (for DT/CDT sequence models)
     """
 
 
@@ -203,9 +187,8 @@ def load_minari_dataset(dataset_id: str):
     return flat, env, traj_list
 
 
-# ══════════════════════════════════════════════════════════════
-# STEP 3 — NOISE INJECTION
-# ══════════════════════════════════════════════════════════════
+
+# NOISE INJECTION
 
 def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> dict:
     """
@@ -276,9 +259,7 @@ def inject_noise_into_trajs(traj_list: list, noise_fraction: float, seed: int) -
     return new_trajs
 
 
-# ══════════════════════════════════════════════════════════════
 # EVALUATION HELPER (gymnasium API)
-# ══════════════════════════════════════════════════════════════
 
 def eval_gymnasium(actor_fn, env, n_episodes: int, seed: int, device: str) -> float:
     """
@@ -300,20 +281,13 @@ def eval_gymnasium(actor_fn, env, n_episodes: int, seed: int, device: str) -> fl
     return float(np.mean(returns))
 
 
-# ══════════════════════════════════════════════════════════════
-# STATE NORMALISATION HELPERS
-# ══════════════════════════════════════════════════════════════
-
 def compute_mean_std(obs: np.ndarray, eps: float = 1e-3):
     return obs.mean(0), obs.std(0) + eps
 
 def normalize_states(obs: np.ndarray, mean, std):
     return (obs - mean) / std
 
-
-# ══════════════════════════════════════════════════════════════
 # RUN CQL
-# ══════════════════════════════════════════════════════════════
 
 def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> float:
 
@@ -375,15 +349,25 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
             raw = eval_gymnasium(actor_fn, eval_env, n_episodes=10, seed=seed, device=device)
             norm = get_normalized_score(raw)
             print(f"  [CQL] step {t+1:>7,}  norm_score={norm:.2f}")
-            best_score = max(best_score, norm)
+
+            if norm > best_score:
+                best_score = norm
+                checkpoint = {
+                    "algo": "cql",
+                    "actor_state": actor.state_dict(),
+                    "state_mean": state_mean,
+                    "state_std": state_std,
+                    "best_score": best_score,
+                }
+                checkpointpath = f"checkpoints/cql_seed_{seed}_best.pt"
+                torch.save(checkpoint, checkpointpath)
+                print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
+
             wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=t)
 
     return best_score
 
-
-# ══════════════════════════════════════════════════════════════
 # RUN DT
-# ══════════════════════════════════════════════════════════════
 
 def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
 
@@ -540,6 +524,19 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                     best_score = max(best_score, norm)
                     print(f"  [DT]  step {step+1:>7,}  target={target_return}  norm_score={norm:.2f}")
 
+                    #save checkpoint
+                    if norm > best_score:
+                        checkpoint = {"algo": "dt",
+                                    "model_state": model.state_dict(),
+                                    "statemean": state_mean,
+                                    "state_std": state_std,
+                                    "seq_len": seq_len,
+                                    "reward_scale": reward_scale,
+                                    "best_score": best_score,}
+                        checkpointpath = f"checkpoints/dt_seed_{seed}_best.pt"
+                        torch.save(checkpoint, checkpointpath)
+                        print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
+
                 wandb.log(
                     {
                         f"eval/{target_return}_return_mean": mean_raw_return,
@@ -551,16 +548,9 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
         
     return best_score
 
-
-# ══════════════════════════════════════════════════════════════
-# RUN CDT (stub)
-# ══════════════════════════════════════════════════════════════
+# RUN CDT
 
 def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
-    """
-    CDT stub. Model instantiation works; the train_one_step batch loop
-    needs wiring once the OSRL dependency is confirmed on your system.
-    """
 
     set_seed(seed)
     state_dim  = env.observation_space.shape[0]
@@ -584,14 +574,56 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> 
     # TODO: build batch sampler for train_one_step:
     # trainer.train_one_step(states, actions, returns, costs_return,
     #                        time_steps, mask, episode_cost, costs)
-    # costs = zeros tensor for standard D4RL (no cost signal)
-    print("  [CDT] Training loop not yet wired — returning placeholder.")
+    print("  [CDT] Training loop not yet wired")
     return -1.0
 
+#Checkpoint loader
 
-# ══════════════════════════════════════════════════════════════
+def evaluate_saved_checkpoint(checkpoint_path: str, env_name: str = "Walker2d-v4", device: str = "cuda"):
+    #Load the checkpoint dictionary
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    algo = ckpt["algo"]
+    state_mean = ckpt["state_mean"]
+    state_std = ckpt["state_std"]
+    
+    # Build the environment
+    base_env = gym.make(env_name)
+    
+    class NormObservation(gym.ObservationWrapper):
+        def observation(self, obs):
+            return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
+            
+    eval_env = NormObservation(base_env)
+    
+    if algo == "dt":
+        from dt import DecisionTransformer
+        # Reconstruct the DT architecture
+        model = DecisionTransformer(
+            state_dim=eval_env.observation_space.shape[0],
+            action_dim=eval_env.action_space.shape[0],
+            seq_len=ckpt["seq_len"],
+            episode_len=1000, embedding_dim=128, num_layers=3, num_heads=1,
+            max_action=float(eval_env.action_space.high[0])
+        ).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        print(f"Successfully loaded DT checkpoint. Historical Best Score: {ckpt['best_score']:.2f}")
+
+    elif algo == "cql":
+        from cql import TanhGaussianPolicy
+        # Reconstruct the CQL Actor
+        actor = TanhGaussianPolicy(
+            state_dim=eval_env.observation_space.shape[0],
+            action_dim=eval_env.action_space.shape[0],
+            max_action=float(eval_env.action_space.high[0])
+        ).to(device)
+        actor.load_state_dict(ckpt["actor_state"])
+        print(f"Successfully loaded CQL checkpoint. Historical Best Score: {ckpt['best_score']:.2f}")
+
+    elif algo == "cdt":
+        print("todo")
+
 # RESULTS
-# ══════════════════════════════════════════════════════════════
 
 RESULTS_FILE = "experiment_a_results.csv"
 
@@ -627,21 +659,14 @@ def summarise_results():
 NOISE_LEVELS = [0.0, 0.25, 0.50, 0.75]
 SEEDS        = [0, 1, 2, 3, 4]
 ALGOS        = ["cql", "dt"]    #["cql", "dt", "cdt"]
+STEPS_ALGO   = [1000000, 100000]
 
 
-def run_single(algo, noise, seed, dataset_id, device, dt_steps, cql_steps):
+def run_single(algo, noise, seed, dataset_id, device, steps):
     print("Experiment A")
     print(f"\n{'─'*55}")
     print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}")
     print(f"{'─'*55}")
-
-    try:
-        if cql_steps is not None:
-            steps = cql_steps
-        elif dt_steps is not None:
-            steps = dt_steps
-    except Exception as e:
-        print("Error: "+ e)
     
     if wandb.run is not None:
         wandb.finish()
@@ -661,11 +686,12 @@ def run_single(algo, noise, seed, dataset_id, device, dt_steps, cql_steps):
     noisy_trajs = inject_noise_into_trajs(trajs, noise, seed)
 
     if algo == "cql":
-        score = run_cql(noisy_flat,  env, seed, device, cql_steps)
+        score = run_cql(noisy_flat,  env, seed, device, steps)
     elif algo == "dt":
-        score = run_dt(noisy_trajs,  env, seed, device, dt_steps)
+        score = run_dt(noisy_trajs,  env, seed, device, steps)
     elif algo == "cdt":
-        score = run_cdt(noisy_trajs, env, seed, device, dt_steps)
+        #TODO score = run_cdt(noisy_trajs, env, seed, device, steps)
+        print("test")
 
     log_result(algo, noise, seed, score)
     wandb.finish()
@@ -680,10 +706,10 @@ if __name__ == "__main__":
         for algo in ALGOS:
             for noise in NOISE_LEVELS:
                 for seed in SEEDS:
-                    run_single(algo, noise, seed,
-                               args.dataset, device, args.dt_steps, args.cql_steps)
+                    #run_single(algo, noise, seed, args.dataset, device, args.steps)
+                    print("todo")
         summarise_results()
     else:
         run_single(args.algo, args.noise, args.seed,
-                   args.dataset, device, args.dt_steps, args.cql_steps)
+                   args.dataset, device, args.steps)
         summarise_results()
