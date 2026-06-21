@@ -35,9 +35,6 @@ from torch.nn import functional as F
 from dt import DecisionTransformer, pad_along_axis
 from tqdm import trange
 
-#device specs
-#import torch_directml
-
 #cql
 from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
 
@@ -46,6 +43,10 @@ from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, Repl
 
 #video of training
 from gymnasium.wrappers import RecordVideo
+
+#checkpoints
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -362,7 +363,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
                     "state_std": state_std,
                     "best_score": best_score,
                 }
-                checkpointpath = f"checkpoints/cql_seed_{seed}_best.pt"
+                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_seed_{seed}_best.pt")
                 torch.save(checkpoint, checkpointpath)
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -544,19 +545,19 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                 norm = get_normalized_score(mean_raw_return)
                 
                 if target_return == 4500.0:
-                    best_score = max(best_score, norm)
                     print(f"  [DT]  step {step+1:>7,}  target={target_return}  norm_score={norm:.2f}")
 
                     #save checkpoint
                     if norm > best_score:
+                        best_score = norm
                         checkpoint = {"algo": "dt",
                                     "model_state": model.state_dict(),
-                                    "statemean": state_mean,
+                                    "state_mean": state_mean,
                                     "state_std": state_std,
                                     "seq_len": seq_len,
                                     "reward_scale": reward_scale,
                                     "best_score": best_score,}
-                        checkpointpath = f"checkpoints/dt_seed_{seed}_best.pt"
+                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_seed_{seed}_best.pt")
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
