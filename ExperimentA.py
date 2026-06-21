@@ -44,6 +44,9 @@ from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, Repl
 #cdt
 #from cdt import CDT, CDTTrainer
 
+#video of training
+from gymnasium.wrappers import RecordVideo
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
@@ -112,7 +115,7 @@ def set_seed(seed: int, env=None):
         env.reset(seed=seed)   # gymnasium API uses reset(seed=) not env.seed()
         env.action_space.seed(seed)
 
-# STEP 2 — DATASET LOADING (Minari)
+# DATASET LOADING (Minari) _______________________________________________________________________________________________
 
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
 # These are fixed constants
@@ -188,7 +191,7 @@ def load_minari_dataset(dataset_id: str):
 
 
 
-# NOISE INJECTION
+# NOISE INJECTION _______________________________________________________________________________________________
 
 def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> dict:
     """
@@ -364,6 +367,26 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
             wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=t)
+
+    #Recording video
+    print("\n[CQL] Recording final evaluation video...")
+    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+    
+    video_env = RecordVideo(
+        video_base_env, 
+        video_folder=f"videos/cql_seed_{seed}_bestscore{best_score}", 
+        episode_trigger=lambda ep: True,
+        disable_logger=True
+    )
+    video_env = NormWrapper(video_env)
+    obs, _ = video_env.reset(seed=seed)
+    done = False
+    while not done:
+        action = actor_fn(obs, device)
+        obs, reward, terminated, truncated, _ = video_env.step(action)
+        done = terminated or truncated    
+    video_env.close()
+    print("[CQL] Video saved.")
 
     return best_score
 
@@ -545,6 +568,45 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                     step=step,
                 )
             model.train()
+
+    #Recording video
+    print("\n[DT] Recording final evaluation video...")
+    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+    video_env = RecordVideo(
+        video_base_env, 
+        video_folder=f"videos/dt_seed_{seed}_bestscore_{best_score}", 
+        episode_trigger=lambda ep: True,
+        disable_logger=True
+    )
+    video_env = NormObservation(video_env)
+    video_env = ScaleReward(video_env)
+
+    states = torch.zeros(1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device)
+    actions = torch.zeros(1, model.episode_len, model.action_dim, dtype=torch.float, device=device)
+    returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
+    time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device).view(1, -1)
+
+    obs, _ = video_env.reset(seed=seed + 999)
+    states[:, 0] = torch.as_tensor(obs, device=device)
+    returns[:, 0] = torch.as_tensor(4500.0 * reward_scale, device=device)
+
+    for step in range(model.episode_len):
+        predicted_actions = model(
+            states[:, : step + 1][:, -model.seq_len :],
+            actions[:, : step + 1][:, -model.seq_len :],
+            returns[:, : step + 1][:, -model.seq_len :],
+            time_steps[:, : step + 1][:, -model.seq_len :],
+        )
+        predicted_action = predicted_actions[0, -1].cpu().detach().numpy()
+        next_state, reward, terminated, truncated, _ = video_env.step(predicted_action)
+        actions[:, step] = torch.as_tensor(predicted_action)
+        states[:, step + 1] = torch.as_tensor(next_state)
+        returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+        if terminated or truncated:
+            break
+
+    video_env.close()
+    print("[DT] Video saved.")
         
     return best_score
 

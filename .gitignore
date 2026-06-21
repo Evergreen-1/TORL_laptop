@@ -434,3 +434,9 @@ wandb/
 
 #venv
 cql_venv/
+
+#videos
+videos/
+
+#checkpoints
+checkpoints/
