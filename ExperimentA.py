@@ -586,7 +586,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
     time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device).view(1, -1)
 
-    obs, _ = video_env.reset(seed=seed + 999)
+    obs, _ = video_env.reset(seed=seed)
     states[:, 0] = torch.as_tensor(obs, device=device)
     returns[:, 0] = torch.as_tensor(4500.0 * reward_scale, device=device)
 
