@@ -100,6 +100,8 @@ def get_args():
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
     parser.add_argument("--steps", type=int,   default=100_000)
     parser.add_argument("--full",      action="store_true")
+    parser.add_argument("--checkpoint", type=str, default=None)     #loading checkpoint filepath: checkpoints/...
+    parser.add_argument("--resume", action="store_true")            #resuming training 
     return parser.parse_args()
 
 
@@ -291,9 +293,93 @@ def compute_mean_std(obs: np.ndarray, eps: float = 1e-3):
 def normalize_states(obs: np.ndarray, mean, std):
     return (obs - mean) / std
 
+#LOADING CHECKPOINTS
+
+def run_checkpoint_evaluation(checkpoint_path: str, device: str):
+    """Loads a saved checkpoint and runs a standalone evaluation rollout loop."""
+    
+    if not os.path.exists(checkpoint_path):
+        print(f"CRITICAL: Checkpoint file not found at {checkpoint_path}")
+        return
+    
+    print(f"\nLOADING CHECKPOINT; Path: {checkpoint_path}")
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    algo = ckpt["algo"]
+    state_mean = ckpt["state_mean"]
+    state_std = ckpt["state_std"]
+
+    print(f"Algorithm: {algo.upper()} with best score {ckpt['best_score']:.2f}")
+    
+    base_env = gym.make("Walker2d-v5")
+
+    class NormWrapper(gym.ObservationWrapper):
+        def observation(self, obs):
+            return (obs - state_mean) / state_std
+
+    eval_env = NormWrapper(base_env)
+    state_dim = eval_env.observation_space.shape[0]
+    action_dim = eval_env.action_space.shape[0]
+    max_action = float(eval_env.action_space.high[0])
+
+    if algo == "dt":
+        class NormWrapper(gym.ObservationWrapper):
+            def observation(self, obs):
+                return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
+
+        eval_env = NormWrapper(base_env)
+        model = DecisionTransformer(
+            state_dim=state_dim, action_dim=action_dim, seq_len=ckpt["seq_len"],
+            episode_len=1000, embedding_dim=128, num_layers=3, num_heads=1, max_action=max_action
+        ).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+
+        target_return = 3000.0 * ckpt["reward_scale"]
+        rets = []
+        for ep_i in range(10):
+            obs, _ = eval_env.reset(seed=ckpt["seed"] + ep_i)
+            states = torch.zeros(1, 1001, state_dim, device=device)
+            actions = torch.zeros(1, 1000, action_dim, device=device)
+            returns = torch.zeros(1, 1001, device=device)
+            timesteps = torch.arange(1000, device=device).unsqueeze(0)
+            states[0, 0] = torch.as_tensor(obs, device=device)
+            returns[0, 0] = target_return
+
+            ep_ret, done = 0.0, False
+            for step in range(1000):
+                pred = model(states=states[:, :step+1][:, -ckpt["seq_len"]:],
+                             actions=actions[:, :step+1][:, -ckpt["seq_len"]:],
+                             returns_to_go=returns[:, :step+1][:, -ckpt["seq_len"]:],
+                             time_steps=timesteps[:, :step+1][:, -ckpt["seq_len"]:])
+                act = pred[0, -1].clamp(-max_action, max_action).cpu().detach().numpy()
+                obs, reward, terminated, truncated, _ = eval_env.step(act)
+                actions[0, step] = torch.as_tensor(act, device=device)
+                states[0, step+1] = torch.as_tensor(obs, device=device)
+                returns[0, step+1] = returns[0, step] - (reward * ckpt["reward_scale"])
+                ep_ret += reward
+                if terminated or truncated: break
+            rets.append(ep_ret)
+        raw_score = float(np.mean(rets))
+
+    elif algo == "cql":
+        class NormWrapper(gym.ObservationWrapper):
+            def observation(self, obs):
+                return (obs - state_mean) / state_std
+
+        eval_env = NormWrapper(base_env)
+        actor = TanhGaussianPolicy(state_dim, action_dim, max_action, orthogonal_init=True).to(device)
+        actor.load_state_dict(ckpt["actor_state"])
+        raw_score = eval_gymnasium(lambda o, d: actor.act(o, d), eval_env, 10, ckpt["seed"], device)
+
+    norm = get_normalized_score(raw_score)
+    print(f"Checkpoint Evaluation Complete | Algorithm: {algo.upper()}")
+    print(f"  → D4RL Normalized Score: {norm:.2f} (Saved Best Was: {ckpt.get('best_score', 0.0):.2f})")
+
 # RUN CQL
 
-def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> float:
+def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int, 
+            dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
     set_seed(seed, env)
 
@@ -337,14 +423,33 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
         cql_n_actions=10, cql_importance_sample=True, cql_lagrange=False,
         cql_temp=1.0, cql_alpha=10.0, cql_max_target_backup=False, device=device,
     )
+    start_step = 0
+    best_score = -np.inf
+    #Loading checkpoint if it exists
+    if checkpoint_path is not None:
+        print(f"[CQL] Loading checkpoint state from: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        actor.load_state_dict(ckpt["actor_state"])
+        critic_1.load_state_dict(ckpt["critic_1_state"])
+        critic_2.load_state_dict(ckpt["critic_2_state"])
+        trainer.critic_1_optimizer.load_state_dict(ckpt["critic_1_optim_state"])
+        trainer.critic_2_optimizer.load_state_dict(ckpt["critic_2_optim_state"])
+        trainer.actor_optimizer.load_state_dict(ckpt["actor_optim_state"])
+        if "alpha_optim_state" in ckpt and hasattr(trainer, "alpha_optimizer") and trainer.alpha_optimizer is not None:
+            trainer.alpha_optimizer.load_state_dict(ckpt["alpha_optim_state"])
+        if "log_alpha" in ckpt and hasattr(trainer, "log_alpha"):
+            with torch.no_grad():
+                next(trainer.log_alpha.parameters()).copy_(ckpt["log_alpha"])
+        start_step = ckpt["step"] + 1
+        best_score = ckpt.get("best_score", -np.inf)
+        print(f"[CQL] Re-entering training loop context at step {start_step:,}")
 
     def actor_fn(obs, dev):
         return actor.act(obs, dev)
 
     eval_freq  = max(max_steps // 20, 5_000)
-    best_score = -np.inf
 
-    for t in trange(max_steps, desc="CQL Training"):
+    for t in trange(start_step, max_steps, desc="CQL Training"):
         batch = [b.to(device) for b in buf.sample(256)]
         log_cql = trainer.train(batch)
         if log_cql and isinstance(log_cql, dict):
@@ -357,13 +462,22 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
             if norm > best_score:
                 best_score = norm
                 checkpoint = {
-                    "algo": "cql",
-                    "actor_state": actor.state_dict(),
-                    "state_mean": state_mean,
-                    "state_std": state_std,
-                    "best_score": best_score,
+                "algo": "cql", "noise": noise, "seed": seed, "dataset": dataset_id,
+                "step": t, "best_score": max(best_score, norm),
+                "actor_state": actor.state_dict(),
+                "critic_1_state": critic_1.state_dict(), "critic_2_state": critic_2.state_dict(),
+                "critic_1_optim_state": trainer.critic_1_optimizer.state_dict(),
+                "critic_2_optim_state": trainer.critic_2_optimizer.state_dict(),
+                "actor_optim_state": trainer.actor_optimizer.state_dict(),
+                "state_mean": state_mean, "state_std": state_std
                 }
-                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_seed_{seed}_best.pt")
+                if hasattr(trainer, "alpha_optimizer") and trainer.alpha_optimizer is not None:
+                    checkpoint["alpha_optim_state"] = trainer.alpha_optimizer.state_dict()
+                if hasattr(trainer, "log_alpha"):
+                    checkpoint["log_alpha"] = next(trainer.log_alpha.parameters()).clone()
+
+                
+                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_noise_{noise:.2f}_seed_{seed}.pt")
                 torch.save(checkpoint, checkpointpath)
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -393,7 +507,8 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int) -> 
 
 # RUN DT
 
-def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
+def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int, 
+           dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
     set_seed(seed)
 
@@ -455,6 +570,17 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
     eval_freq      = max(update_steps // 10, 10_000)
     target_returns = (4500.0, 2250.0)  # Standard D4RL testing intervals mapped to Walker2d scale
     best_score     = -np.inf
+    start_step = 0
+
+    if checkpoint_path is not None:
+        print(f"[DT] Loading checkpoint state map securely from: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        optim.load_state_dict(ckpt["optim_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_step = ckpt["step"] + 1
+        best_score = ckpt.get("best_score", -np.inf)
+        print(f"[DT] Re-entering training loop context at step {start_step:,}")
 
     class NormObservation(gym.ObservationWrapper):
         def observation(self, obs):
@@ -491,8 +617,8 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
             next_state, reward, terminated, truncated, _ = eval_env.step(predicted_action)
             done = terminated or truncated
             
-            actions[:, step] = torch.as_tensor(predicted_action)
-            states[:, step + 1] = torch.as_tensor(next_state)
+            actions[:, step] = torch.as_tensor(predicted_action, device=device)
+            states[:, step + 1] = torch.as_tensor(next_state, device=device)
             returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
 
             episode_return += reward
@@ -503,7 +629,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
         return episode_return, episode_len
 
     model.train()
-    for step in trange(update_steps, desc="DT Training"):
+    for step in trange(start_step, update_steps, desc="DT Training"):
         batch = sample_batch(64)
         states, actions, returns, time_steps, mask = [b.to(device) for b in batch]
         padding_mask = ~mask.to(torch.bool)
@@ -550,14 +676,16 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
                     #save checkpoint
                     if norm > best_score:
                         best_score = norm
-                        checkpoint = {"algo": "dt",
-                                    "model_state": model.state_dict(),
-                                    "state_mean": state_mean,
-                                    "state_std": state_std,
-                                    "seq_len": seq_len,
-                                    "reward_scale": reward_scale,
-                                    "best_score": best_score,}
-                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_seed_{seed}_best.pt")
+                        checkpoint= {
+                            "algo": "dt", "noise": noise, "seed": seed, "dataset": dataset_id,
+                            "step": step, "best_score": max(best_score, norm),
+                            "model_state": model.state_dict(),
+                            "optim_state": optim.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "state_mean": state_mean, "state_std": state_std,
+                            "seq_len": seq_len, "reward_scale": reward_scale
+                        }
+                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_noise_{noise:.2f}_seed_{seed}.pt")
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -615,7 +743,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int) -> f
 
 def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
 
-    set_seed(seed)
+    """set_seed(seed)
     state_dim  = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -632,59 +760,13 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> 
         learning_rate=1e-4, weight_decay=1e-4, betas=(0.9, 0.999),
         clip_grad=0.25, lr_warmup_steps=10_000,
         reward_scale=0.001, cost_scale=1.0, device=device,
-    )
+    )"""
 
     # TODO: build batch sampler for train_one_step:
     # trainer.train_one_step(states, actions, returns, costs_return,
     #                        time_steps, mask, episode_cost, costs)
     print("  [CDT] Training loop not yet wired")
     return -1.0
-
-#Checkpoint loader
-
-def evaluate_saved_checkpoint(checkpoint_path: str, env_name: str = "Walker2d-v4", device: str = "cuda"):
-    #Load the checkpoint dictionary
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    algo = ckpt["algo"]
-    state_mean = ckpt["state_mean"]
-    state_std = ckpt["state_std"]
-    
-    # Build the environment
-    base_env = gym.make(env_name)
-    
-    class NormObservation(gym.ObservationWrapper):
-        def observation(self, obs):
-            return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
-            
-    eval_env = NormObservation(base_env)
-    
-    if algo == "dt":
-        from dt import DecisionTransformer
-        # Reconstruct the DT architecture
-        model = DecisionTransformer(
-            state_dim=eval_env.observation_space.shape[0],
-            action_dim=eval_env.action_space.shape[0],
-            seq_len=ckpt["seq_len"],
-            episode_len=1000, embedding_dim=128, num_layers=3, num_heads=1,
-            max_action=float(eval_env.action_space.high[0])
-        ).to(device)
-        model.load_state_dict(ckpt["model_state"])
-        model.eval()
-        print(f"Successfully loaded DT checkpoint. Historical Best Score: {ckpt['best_score']:.2f}")
-
-    elif algo == "cql":
-        from cql import TanhGaussianPolicy
-        # Reconstruct the CQL Actor
-        actor = TanhGaussianPolicy(
-            state_dim=eval_env.observation_space.shape[0],
-            action_dim=eval_env.action_space.shape[0],
-            max_action=float(eval_env.action_space.high[0])
-        ).to(device)
-        actor.load_state_dict(ckpt["actor_state"])
-        print(f"Successfully loaded CQL checkpoint. Historical Best Score: {ckpt['best_score']:.2f}")
-
-    elif algo == "cdt":
-        print("todo")
 
 # RESULTS
 
@@ -725,46 +807,53 @@ ALGOS        = ["cql", "dt"]    #["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 
 
-def run_single(algo, noise, seed, dataset_id, device, steps):
+def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=None):
     print("Experiment A")
-    print(f"\n{'─'*55}")
     print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}")
     print(f"{'─'*55}")
     
     if wandb.run is not None:
         wandb.finish()
-    
+      
+      
     wandb.init(project = "Experiment-A",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}",
-               config ={"algo": algo,
-                        "noise_level": noise,
-                        "seed": seed,
-                        "dataset_id": dataset_id,
-                        "device:": device,
-                        "steps": steps})
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}" + ("_resumed" if checkpoint_path else ""),
+               config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
-
     noisy_flat  = inject_gaussian_noise(flat,  noise, seed)
     noisy_trajs = inject_noise_into_trajs(trajs, noise, seed)
 
     if algo == "cql":
-        score = run_cql(noisy_flat,  env, seed, device, steps)
+        score = run_cql(noisy_flat,  env, seed, device, steps, dataset_id, noise, checkpoint_path)
     elif algo == "dt":
-        score = run_dt(noisy_trajs,  env, seed, device, steps)
+        score = run_dt(noisy_trajs,  env, seed, device, steps, dataset_id, noise, checkpoint_path)
     elif algo == "cdt":
-        #TODO score = run_cdt(noisy_trajs, env, seed, device, steps)
-        print("test")
+        score = run_cdt(noisy_trajs, env, seed, device, steps)
 
     log_result(algo, noise, seed, score)
     wandb.finish()
     return score
 
-
 if __name__ == "__main__":
     args   = get_args()
     device = get_device(args.device)
+    if args.checkpoint is not None:
+        if args.resume:
+            print(f"[Harness] Loading historical parameters to resume training perfectly...")
+            ckpt = torch.load(args.checkpoint, map_location="cpu")
 
+            # Extract and force parameters to preserve absolute dataset identity
+            algo = ckpt["algo"]
+            noise = ckpt["noise"]
+            seed = ckpt["seed"]
+            dataset = ckpt["dataset"]
+
+            print(f"→ Recovered configuration: ALGO={algo}, NOISE={noise}, SEED={seed}, DATASET={dataset}")
+            run_single(algo, noise, seed, dataset, device, args.steps, checkpoint_path=args.checkpoint)
+        else:
+            run_checkpoint_evaluation(args.checkpoint, device)
+        sys.exit(0)
     if args.full:
         for algo in ALGOS:
             for noise in NOISE_LEVELS:
@@ -774,5 +863,5 @@ if __name__ == "__main__":
         summarise_results()
     else:
         run_single(args.algo, args.noise, args.seed,
-                   args.dataset, device, args.steps)
+                   args.dataset, device, args.steps,checkpoint_path=args.checkpoint)
         summarise_results()
