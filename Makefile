@@ -8,7 +8,7 @@ NOISE         = 0.0
 SEED          = 1
 DEVICE        = directml
 CHECKPOINT    = checkpoints/cql_noise_0.00_seed_0.pt
-STEPS		  = 35000
+STEPS		  = 100000
 RESUME        = True
 
 .PHONY: help run run-full eval

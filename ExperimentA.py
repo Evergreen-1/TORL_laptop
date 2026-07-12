@@ -39,7 +39,7 @@ from tqdm import trange
 from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
 
 #cdt
-#from cdt import CDT, CDTTrainer
+from cdt import CDT, CDTTrainer, WalkerCDTTrainer
 
 #video of training
 from gymnasium.wrappers import RecordVideo
@@ -741,32 +741,148 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
 
 # RUN CDT
 
-def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int) -> float:
+def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
-    """set_seed(seed)
+    set_seed(seed)
+
+    all_obs    = np.concatenate([t["observations"] for t in traj_list])
+    state_mean = all_obs.mean(0, keepdims=True)
+    state_std  = all_obs.std(0, keepdims=True) + 1e-6
+
+    seq_len      = 20
+    reward_scale = 0.001
+    traj_lens    = np.array([len(t["actions"]) for t in traj_list])
+    sample_prob  = traj_lens / traj_lens.sum()
+
     state_dim  = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
+    def sample_batch(batch_size):
+        S, A, R, C, T, M, EC, Costs = [], [], [], [], [], [], [], []
+        for _ in range(batch_size):
+            traj_idx  = np.random.choice(len(traj_list), p=sample_prob)
+            traj      = traj_list[traj_idx]
+            start_idx = random.randint(0, traj["rewards"].shape[0] - 1)
+
+            states     = traj["observations"][start_idx : start_idx + seq_len]
+            actions    = traj["actions"][start_idx : start_idx + seq_len]
+            returns    = traj["returns"][start_idx : start_idx + seq_len]
+            costs_rtg  = np.zeros(len(returns), dtype=np.float32)
+            costs_bin  = np.zeros(len(returns), dtype=np.float32)
+            time_steps = np.arange(start_idx, start_idx + seq_len)
+            episode_cost = np.float32(0.0)
+
+            states  = (states - state_mean) / state_std
+            returns = returns * reward_scale
+
+            mask = np.hstack([np.ones(states.shape[0]), np.zeros(seq_len - states.shape[0])])
+            if states.shape[0] < seq_len:
+                states    = pad_along_axis(states,    pad_to=seq_len)
+                actions   = pad_along_axis(actions,   pad_to=seq_len)
+                returns   = pad_along_axis(returns,   pad_to=seq_len)
+                costs_rtg = pad_along_axis(costs_rtg, pad_to=seq_len)
+                costs_bin = pad_along_axis(costs_bin, pad_to=seq_len)
+
+            S.append(states); A.append(actions); R.append(returns)
+            C.append(costs_rtg); T.append(time_steps); M.append(mask)
+            EC.append(episode_cost); Costs.append(costs_bin)
+
+        to_t = lambda x, dtype=torch.float32: torch.tensor(np.stack(x), dtype=dtype, device=device)
+        return (
+            to_t(S), to_t(A), to_t(R), to_t(C),
+            to_t(T, dtype=torch.long), to_t(M),
+            to_t(EC), to_t(Costs),
+        )
+
     model = CDT(
         state_dim=state_dim, action_dim=action_dim, max_action=max_action,
-        seq_len=20, episode_len=1000, embedding_dim=128,
-        num_layers=3, num_heads=4,
-        use_rew=True, use_cost=True, stochastic=False,
+        seq_len=seq_len, episode_len=1000, embedding_dim=128,
+        num_layers=3, num_heads=1,
+        attention_dropout=0.1, residual_dropout=0.1, embedding_dropout=0.1,
+        use_rew=True, use_cost=False,
+        stochastic=True,
+        target_entropy=-action_dim,
     ).to(device)
 
-    trainer = CDTTrainer(
-        model=model, env=env,
+    class NormObs(gym.ObservationWrapper):
+        def observation(self, obs):
+            return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
+
+    eval_env = NormObs(env)
+
+    trainer = WalkerCDTTrainer(
+        model=model, env=eval_env,
         learning_rate=1e-4, weight_decay=1e-4, betas=(0.9, 0.999),
         clip_grad=0.25, lr_warmup_steps=10_000,
-        reward_scale=0.001, cost_scale=1.0, device=device,
-    )"""
+        reward_scale=reward_scale, cost_scale=1.0,
+        loss_cost_weight=0.0, loss_state_weight=0.0,
+        device=device,
+    )
 
-    # TODO: build batch sampler for train_one_step:
-    # trainer.train_one_step(states, actions, returns, costs_return,
-    #                        time_steps, mask, episode_cost, costs)
-    print("  [CDT] Training loop not yet wired")
-    return -1.0
+    start_step = 0
+    best_score = -np.inf
+    eval_freq  = max(update_steps // 10, 10_000)
+
+    if checkpoint_path is not None:
+        print(f"[CDT] Loading checkpoint from: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state"])
+        trainer.optim.load_state_dict(ckpt["optim_state"])
+        trainer.scheduler.load_state_dict(ckpt["scheduler_state"])
+        start_step = ckpt["step"] + 1
+        best_score = ckpt.get("best_score", -np.inf)
+        print(f"[CDT] Resuming at step {start_step:,}")
+
+    model.train()
+    for step in trange(start_step, update_steps, desc="CDT Training"):
+        states, actions, returns, costs_rtg, time_steps, mask, episode_cost, costs = sample_batch(64)
+        trainer.train_one_step(states, actions, returns, costs_rtg,
+                               time_steps, mask, episode_cost, costs)
+
+        if (step + 1) % eval_freq == 0 or step == update_steps - 1:
+            mean_ret, mean_cost, mean_len = trainer.evaluate(
+                num_rollouts=10,
+                target_return=4500.0 * reward_scale,
+                target_cost=0.0,
+            )
+            raw  = mean_ret
+            norm = get_normalized_score(raw)
+            print(f"  [CDT] step {step+1:>7,}  norm_score={norm:.2f}")
+
+            if norm > best_score:
+                best_score = norm
+                ckpt = {
+                    "algo": "cdt", "noise": noise, "seed": seed, "dataset": dataset_id,
+                    "step": step, "best_score": best_score,
+                    "model_state": model.state_dict(),
+                    "optim_state": trainer.optim.state_dict(),
+                    "scheduler_state": trainer.scheduler.state_dict(),
+                    "state_mean": state_mean, "state_std": state_std,
+                    "seq_len": seq_len, "reward_scale": reward_scale,
+                }
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"cdt_noise_{noise:.2f}_seed_{seed}.pt")
+                torch.save(ckpt, ckpt_path)
+                print(f"  [CDT]  → Saved checkpoint to {ckpt_path}")
+
+            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
+
+    print("\n[CDT] Recording final evaluation video...")
+    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+    video_env = RecordVideo(
+        video_base_env,
+        video_folder=f"videos/cdt_seed_{seed}_bestscore_{best_score}",
+        episode_trigger=lambda ep: True,
+        disable_logger=True,
+    )
+    video_env = NormObs(video_env)
+
+    model.eval()
+    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0)
+    video_env.close()
+    print("[CDT] Video saved.")
+
+    return best_score
 
 # RESULTS
 
@@ -829,7 +945,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
     elif algo == "dt":
         score = run_dt(noisy_trajs,  env, seed, device, steps, dataset_id, noise, checkpoint_path)
     elif algo == "cdt":
-        score = run_cdt(noisy_trajs, env, seed, device, steps)
+        score = run_cdt(noisy_trajs, env, seed, device, steps, dataset_id, noise, checkpoint_path)
 
     log_result(algo, noise, seed, score)
     wandb.finish()

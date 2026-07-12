@@ -4,7 +4,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-from fsrl.utils import DummyLogger, WandbLogger
+#from fsrl.utils import DummyLogger, WandbLogger
 from torch.distributions.beta import Beta
 from torch.nn import functional as F  # noqa
 from tqdm.auto import trange  # noqa
@@ -552,3 +552,59 @@ class CDTTrainer:
                     break
             episode_rets.append(episode_ret)
         return np.mean(episode_rets)
+
+class WalkerCDTTrainer(CDTTrainer):
+        """CDTTrainer with info['cost'] replaced by 0.0 for envs without a cost signal."""
+@torch.no_grad()
+def rollout(self, model, env, target_return, target_cost):
+            # >>> CHANGED: cost = 0.0 instead of info["cost"] * self.cost_scale
+        states = torch.zeros(1, model.episode_len + 1, model.state_dim,
+                             dtype=torch.float, device=self.device)
+        actions = torch.zeros(1, model.episode_len, model.action_dim,
+                              dtype=torch.float, device=self.device)
+        returns = torch.zeros(1, model.episode_len + 1,
+                              dtype=torch.float, device=self.device)
+        costs = torch.zeros(1, model.episode_len + 1,
+                            dtype=torch.float, device=self.device)
+        time_steps = torch.arange(model.episode_len,
+                                  dtype=torch.long, device=self.device).view(1, -1)
+
+        obs, info = env.reset()
+        states[:, 0] = torch.as_tensor(obs, device=self.device)
+        returns[:, 0] = torch.as_tensor(target_return, device=self.device)
+        costs[:, 0] = torch.as_tensor(target_cost, device=self.device)
+        epi_cost = torch.tensor(np.array([target_cost]),
+                                dtype=torch.float, device=self.device)
+
+        episode_ret, episode_cost, episode_len = 0.0, 0.0, 0
+        for step in range(model.episode_len):
+            s = states[:, :step + 1][:, -model.seq_len:]
+            a = actions[:, :step + 1][:, -model.seq_len:]
+            r = returns[:, :step + 1][:, -model.seq_len:]
+            c = costs[:, :step + 1][:, -model.seq_len:]
+            t = time_steps[:, :step + 1][:, -model.seq_len:]
+
+            acts, _, _ = model(s, a, r, c, t, None, epi_cost)
+            if self.stochastic:
+                acts = acts.mean
+            acts = acts.clamp(-self.max_action, self.max_action)
+            act = acts[0, -1].cpu().numpy()
+
+            obs_next, reward, terminated, truncated, info = env.step(act)
+            cost = 0.0  # >>> CHANGED: Walker2d has no cost signal
+            # <<< CHANGED
+
+            actions[:, step] = torch.as_tensor(act)
+            states[:, step + 1] = torch.as_tensor(obs_next)
+            returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+            costs[:, step + 1] = torch.as_tensor(costs[:, step] - cost)
+
+            episode_ret += reward
+            episode_len += 1
+            episode_cost += cost
+
+            if terminated or truncated:
+                break
+
+        return episode_ret, episode_len, episode_cost
+    
