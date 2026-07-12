@@ -5,11 +5,44 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from fsrl.utils import DummyLogger, WandbLogger
+from dt import TransformerBlock
 from torch.distributions.beta import Beta
 from torch.nn import functional as F  # noqa
 from tqdm.auto import trange  # noqa
 
-from osrl.common.net import DiagGaussianActor, TransformerBlock, mlp
+#from osrl.common.net import DiagGaussianActor, TransformerBlock, mlp
+
+#addaptions of cdt
+from dt import TransformerBlock
+
+def mlp(sizes, activation, output_activation=nn.Identity):
+    layers = []
+    for i in range(len(sizes) - 1):
+        act = activation if i < len(sizes) - 2 else output_activation
+        layers += [nn.Linear(sizes[i], sizes[i + 1]), act()]
+    return nn.Sequential(*layers)
+
+
+class DiagGaussianActor(nn.Module):
+    def __init__(self, hidden_dim, action_dim, log_std_min=-5, log_std_max=2):
+        super().__init__()
+        self.mu = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+    def forward(self, x):
+        mu = self.mu(x)
+        log_std = torch.clamp(self.log_std(x), self.log_std_min, self.log_std_max)
+        std = log_std.exp()
+        return torch.distributions.Normal(mu, std)
+    
+class DummyLogger:
+    def store(self, *args, **kwargs):
+        pass
+
+class WandbLogger(DummyLogger):
+    pass
 
 
 class CDT(nn.Module):
@@ -292,7 +325,7 @@ class CDTTrainer:
             self,
             model: CDT,
             env: gym.Env,
-            logger: WandbLogger = DummyLogger(),
+            logger: None,        #WandbLogger = DummyLogger(),
             # training params
             learning_rate: float = 1e-4,
             weight_decay: float = 1e-4,
@@ -307,7 +340,7 @@ class CDTTrainer:
             no_entropy: bool = False,
             device="cpu") -> None:
         self.model = model
-        self.logger = logger
+        self.logger = logger or DummyLogger()
         self.env = env
         self.clip_grad = clip_grad
         self.reward_scale = reward_scale
