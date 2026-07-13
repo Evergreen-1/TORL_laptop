@@ -95,7 +95,7 @@ def get_args():
     parser.add_argument("--noise",     type=float, default=0.0)
     parser.add_argument("--seed",      type=int,   default=0)
     parser.add_argument("--device",    type=str,   default="cpu")
-    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/expert-v0") #mujoco/walker2d/medium-v0
+    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0") #mujoco/walker2d/medium-v0
     parser.add_argument("--dt_steps",  type=int,   default=100_000)
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
     parser.add_argument("--steps", type=int,   default=100_000)
@@ -808,8 +808,13 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
     class NormObs(gym.ObservationWrapper):
         def observation(self, obs):
             return ((obs - state_mean.squeeze()) / state_std.squeeze()).astype(np.float32)
+        
+    class ScaleReward(gym.RewardWrapper):
+        def reward(self, reward):
+            return reward * reward_scale
 
     eval_env = NormObs(env)
+    eval_env = ScaleReward(eval_env)
 
     trainer = WalkerCDTTrainer(
         model=model, env=eval_env,

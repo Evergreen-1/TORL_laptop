@@ -325,7 +325,7 @@ class CDTTrainer:
             self,
             model: CDT,
             env: gym.Env,
-            logger: None,        #WandbLogger = DummyLogger(),
+            logger=None,        #WandbLogger = DummyLogger(),
             # training params
             learning_rate: float = 1e-4,
             weight_decay: float = 1e-4,
@@ -587,9 +587,10 @@ class CDTTrainer:
         return np.mean(episode_rets)
 
 class WalkerCDTTrainer(CDTTrainer):
-        """CDTTrainer with info['cost'] replaced by 0.0 for envs without a cost signal."""
-@torch.no_grad()
-def rollout(self, model, env, target_return, target_cost):
+    """CDTTrainer with info['cost'] replaced by 0.0 for envs without a cost signal."""
+
+    @torch.no_grad()
+    def rollout(self, model, env, target_return, target_cost):
             # >>> CHANGED: cost = 0.0 instead of info["cost"] * self.cost_scale
         states = torch.zeros(1, model.episode_len + 1, model.state_dim,
                              dtype=torch.float, device=self.device)
