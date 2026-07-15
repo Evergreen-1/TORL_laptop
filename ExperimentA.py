@@ -196,7 +196,31 @@ def load_minari_dataset(dataset_id: str):
 
 # NOISE INJECTION _______________________________________________________________________________________________
 
-def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> dict:
+def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int):
+    if noise_fraction == 0.0:
+        return None
+
+    rng = np.random.default_rng(seed)
+    n = dataset["observations"].shape[0]
+    n_corrupt = int(n * noise_fraction)
+    idx = rng.choice(n, size=n_corrupt, replace=False)
+
+    obs_std = dataset["observations"].std(axis=0)
+    rew_std = float(dataset["rewards"].std())
+
+    # exact same batched calls, same order, as the original inject_gaussian_noise
+    obs_noise = rng.normal(0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32)
+    rew_noise = rng.normal(0, 0.1 * rew_std, n_corrupt).astype(np.float32)
+
+    print("[Noise] "+ noise_fraction + "corrupted with seed "+ seed)
+
+    return {
+        "idx_to_obs_noise": dict(zip(idx.tolist(), obs_noise)),
+        "idx_to_rew_noise": dict(zip(idx.tolist(), rew_noise)),
+        "idx_set": set(idx.tolist()),
+    }
+
+#def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> dict:
     """
     Adds Gaussian noise to observations and rewards of a random subset of
     transitions. Uses an isolated RNG so training seeds are unaffected.
@@ -226,25 +250,29 @@ def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> di
     print(f"[Noise] {noise_fraction*100:.0f}% — {n_corrupt:,}/{n:,} transitions corrupted.")
     return dataset
 
+def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
+    if noise_dict is None:
+        print("[Noise] 0% — clean dataset.")
+        return dataset
 
-def inject_noise_into_trajs(traj_list: list, noise_fraction: float, seed: int) -> list:
+    dataset = {k: v.copy() for k, v in dataset.items()}
+    idx = np.array(sorted(noise_dict["idx_set"]))
+
+    obs_noise = np.stack([noise_dict["idx_to_obs_noise"][i] for i in idx])
+    rew_noise = np.array([noise_dict["idx_to_rew_noise"][i] for i in idx])
+
+    dataset["observations"][idx] += obs_noise
+    dataset["rewards"][idx] += rew_noise
+
+    return dataset
+
+def inject_noise_into_trajs(traj_list: list, noise_dict) -> list:
     """
     Same noise injection but applied to a trajectory list (for DT/CDT).
     Operates on the same random indices as inject_gaussian_noise for consistency.
     """
-    if noise_fraction == 0.0:
+    if noise_dict is None:
         return traj_list
-
-    # Rebuild flat index so we can select the same transitions as the flat version
-    rng = np.random.default_rng(seed)
-    lengths = [len(t["rewards"]) for t in traj_list]
-    n = sum(lengths)
-    n_corrupt = int(n * noise_fraction)
-    corrupt_flat_idx = set(rng.choice(n, size=n_corrupt, replace=False).tolist())
-
-    all_obs = np.concatenate([t["observations"] for t in traj_list])
-    obs_std = all_obs.std(axis=0)
-    rew_std  = float(np.concatenate([t["rewards"] for t in traj_list]).std())
 
     new_trajs = []
     flat_cursor = 0
@@ -252,12 +280,10 @@ def inject_noise_into_trajs(traj_list: list, noise_fraction: float, seed: int) -
         traj = {k: v.copy() for k, v in traj.items()}
         T = len(traj["rewards"])
         for local_i in range(T):
-            if flat_cursor + local_i in corrupt_flat_idx:
-                traj["observations"][local_i] += rng.normal(
-                    0, 0.1 * obs_std
-                ).astype(np.float32)
-                traj["rewards"][local_i] += float(rng.normal(0, 0.1 * rew_std))
-        # Recompute RTG after reward noise
+            flat_i = flat_cursor + local_i
+            if flat_i in noise_dict["idx_set"]:
+                traj["observations"][local_i] += noise_dict["idx_to_obs_noise"][flat_i]
+                traj["rewards"][local_i] += noise_dict["idx_to_rew_noise"][flat_i]
         traj["returns"] = np.cumsum(traj["rewards"][::-1])[::-1].astype(np.float32)
         flat_cursor += T
         new_trajs.append(traj)
@@ -924,7 +950,7 @@ def summarise_results():
 
 NOISE_LEVELS = [0.0, 0.25, 0.50, 0.75]
 SEEDS        = [0, 1, 2, 3, 4]
-ALGOS        = ["cql", "dt"]    #["cql", "dt", "cdt"]
+ALGOS        = ["cql", "dt", "cdt"]    #["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 
 
@@ -942,8 +968,9 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
-    noisy_flat  = inject_gaussian_noise(flat,  noise, seed)
-    noisy_trajs = inject_noise_into_trajs(trajs, noise, seed)
+    noise_dict = generate_noise_dict(flat, noise, seed)
+    noisy_flat  = inject_gaussian_noise(flat,  noise_dict)
+    noisy_trajs = inject_noise_into_trajs(trajs, noise_dict)
 
     if algo == "cql":
         score = run_cql(noisy_flat,  env, seed, device, steps, dataset_id, noise, checkpoint_path)
