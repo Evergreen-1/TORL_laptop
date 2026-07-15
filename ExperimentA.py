@@ -212,7 +212,7 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int):
     obs_noise = rng.normal(0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32)
     rew_noise = rng.normal(0, 0.1 * rew_std, n_corrupt).astype(np.float32)
 
-    print("[Noise] "+ noise_fraction + "corrupted with seed "+ seed)
+    print(f"[Noise] {noise_fraction*100:.0f}% corrupted with seed {seed}")
 
     return {
         "idx_to_obs_noise": dict(zip(idx.tolist(), obs_noise)),
