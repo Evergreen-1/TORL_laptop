@@ -952,13 +952,9 @@ def summarise_results():
     print("="*58)
 
 
-# ══════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════
-
-NOISE_LEVELS = [0.0, 0.25, 0.50, 0.75]
-SEEDS        = [0, 1, 2, 3, 4]
-ALGOS        = ["cql", "dt", "cdt"]    #["cql", "dt", "cdt"]
+NOISE_LEVELS = [0.25, 0.50, 0.75]
+SEEDS        = [1, 2, 3, 4, 5]
+ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 
 
@@ -1011,11 +1007,10 @@ if __name__ == "__main__":
             run_checkpoint_evaluation(args.checkpoint, device)
         sys.exit(0)
     if args.full:
-        for algo in ALGOS:
-            for noise in NOISE_LEVELS:
-                for seed in SEEDS:
-                    #run_single(algo, noise, seed, args.dataset, device, args.steps)
-                    print("todo")
+        # need algo and steps as well to be set
+        for noise in NOISE_LEVELS:
+            for seed in SEEDS:
+                run_single(algo, noise, seed, args.dataset, device, args.steps)
         summarise_results()
     else:
         run_single(args.algo, args.noise, args.seed,
