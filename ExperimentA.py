@@ -196,7 +196,7 @@ def load_minari_dataset(dataset_id: str):
 
 # NOISE INJECTION _______________________________________________________________________________________________
 
-def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int):
+def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_obs: bool = True, noise_rew: bool = True):
     if noise_fraction == 0.0:
         return None
 
@@ -208,9 +208,8 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int):
     obs_std = dataset["observations"].std(axis=0)
     rew_std = float(dataset["rewards"].std())
 
-    # exact same batched calls, same order, as the original inject_gaussian_noise
-    obs_noise = rng.normal(0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32)
-    rew_noise = rng.normal(0, 0.1 * rew_std, n_corrupt).astype(np.float32)
+    obs_noise = (rng.normal(0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32) if noise_obs else np.zeros((n_corrupt, dataset["observations"].shape[1]), dtype=np.float32))
+    rew_noise = (rng.normal(0, 0.1 * rew_std, n_corrupt).astype(np.float32) if noise_rew else np.zeros(n_corrupt, dtype=np.float32))
 
     print(f"[Noise] {noise_fraction*100:.0f}% corrupted with seed {seed}")
 
@@ -263,6 +262,15 @@ def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
 
     dataset["observations"][idx] += obs_noise
     dataset["rewards"][idx] += rew_noise
+
+    #Adding noise to next observation (s_t+1) by shifting observations backwards within an episode
+    prev_idx = idx - 1
+    valid = prev_idx >= 0
+    same_episode = np.zeros_like(valid)
+    same_episode[valid] = dataset["terminals"][prev_idx[valid]] == 0
+
+    valid = valid & same_episode
+    dataset["next_observations"][prev_idx[valid]] += obs_noise[valid]
 
     return dataset
 
@@ -964,11 +972,11 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
       
       
     wandb.init(project = "Experiment-A",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
-    noise_dict = generate_noise_dict(flat, noise, seed)
+    noise_dict = generate_noise_dict(flat, noise, seed, True, False)
     noisy_flat  = inject_gaussian_noise(flat,  noise_dict)
     noisy_trajs = inject_noise_into_trajs(trajs, noise_dict)
 
