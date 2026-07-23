@@ -591,6 +591,7 @@ class WalkerCDTTrainer(CDTTrainer):
 
     @torch.no_grad()
     def rollout(self, model, env, target_return, target_cost):
+
             # >>> CHANGED: cost = 0.0 instead of info["cost"] * self.cost_scale
         states = torch.zeros(1, model.episode_len + 1, model.state_dim,
                              dtype=torch.float, device=self.device)

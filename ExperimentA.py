@@ -23,7 +23,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import wandb
-import torch_directml
+#import torch_directml
 
 #dataset
 import minari
