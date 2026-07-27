@@ -114,6 +114,12 @@ def set_seed(seed: int, env=None):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception as e:
+        print(f"[Determinism] use_deterministic_algorithms failed/unsupported: {e}")
     if env is not None:
         env.reset(seed=seed)   # gymnasium API uses reset(seed=) not env.seed()
         env.action_space.seed(seed)
@@ -479,7 +485,11 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         print(f"[CQL] Re-entering training loop context at step {start_step:,}")
 
     def actor_fn(obs, dev):
-        return actor.act(obs, dev)
+        actor.eval()
+        with torch.no_grad():
+            action = actor.act(obs, dev)
+        actor.train()
+        return action
 
     eval_freq  = max(max_steps // 20, 5_000)
 
@@ -545,7 +555,8 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
            dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
     set_seed(seed)
-
+    #------
+    batch_rng = np.random.default_rng(seed)
 
     all_obs    = np.concatenate([t["observations"] for t in traj_list])
     state_mean = all_obs.mean(0, keepdims=True)
@@ -559,9 +570,9 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
     def sample_batch(batch_size):
         S, A, R, T, M = [], [], [], [], []
         for _ in range(batch_size):
-            traj_idx = np.random.choice(len(traj_list), p=sample_prob)
+            traj_idx = batch_rng.choice(len(traj_list), p=sample_prob)
             traj     = traj_list[traj_idx]
-            start_idx = random.randint(0, traj["rewards"].shape[0] - 1)
+            start_idx = batch_rng.integers(0, traj["rewards"].shape[0] - 1)
             
             states = traj["observations"][start_idx : start_idx + seq_len]
             actions = traj["actions"][start_idx : start_idx + seq_len]
@@ -968,7 +979,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
       
       
     wandb.init(project = "Experiment-A",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_debug" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
