@@ -933,7 +933,7 @@ def log_result(algo, noise, seed, score):
         w = csv.writer(f)
         if write_header:
             w.writerow(["algo", "noise_fraction", "seed", "normalized_score"])
-        w.writerow([algo, noise, seed, f"{score:.4f}"])
+        w.writerow([algo + "_test", noise, seed, f"{score:.4f}"])
     print(f"  → Logged: {algo} | noise={noise:.2f} | seed={seed} | score={score:.2f}")
 
 
@@ -968,7 +968,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
       
       
     wandb.init(project = "Experiment-A",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_debug" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -1010,7 +1010,7 @@ if __name__ == "__main__":
         # need algo and steps as well to be set
         for noise in NOISE_LEVELS:
             for seed in SEEDS:
-                run_single(algo, noise, seed, args.dataset, device, args.steps)
+                run_single(args.algo, noise, seed, args.dataset, args.device, args.steps, checkpoint_path=args.checkpoint)
         summarise_results()
     else:
         run_single(args.algo, args.noise, args.seed,
