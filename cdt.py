@@ -450,15 +450,15 @@ class CDTTrainer:
             train_lr=self.scheduler.get_last_lr()[0],
         )
 
-    def evaluate(self, num_rollouts, target_return, target_cost):
+    def evaluate(self, num_rollouts, target_return, target_cost, seed=None):
         """
         Evaluates the performance of the model on a number of episodes.
         """
         self.model.eval()
         episode_rets, episode_costs, episode_lens = [], [], []
-        for _ in trange(num_rollouts, desc="Evaluating...", leave=False):
+        for i in trange(num_rollouts, desc="Evaluating...", leave=False):
             epi_ret, epi_len, epi_cost = self.rollout(self.model, self.env,
-                                                      target_return, target_cost)
+                                                      target_return, target_cost, seed=(seed + i) if seed is not None else None,)
             episode_rets.append(epi_ret)
             episode_lens.append(epi_len)
             episode_costs.append(epi_cost)
@@ -473,6 +473,7 @@ class CDTTrainer:
         env: gym.Env,
         target_return: float,
         target_cost: float,
+        seed: Optional[int] = None,
     ) -> Tuple[float, float]:
         """
         Evaluates the performance of the model on a single episode.
@@ -500,7 +501,7 @@ class CDTTrainer:
                                   device=self.device)
         time_steps = time_steps.view(1, -1)
 
-        obs, info = env.reset()
+        obs, info = env.reset(seed=seed)
         states[:, 0] = torch.as_tensor(obs, device=self.device)
         returns[:, 0] = torch.as_tensor(target_return, device=self.device)
         costs[:, 0] = torch.as_tensor(target_cost, device=self.device)
@@ -590,7 +591,7 @@ class WalkerCDTTrainer(CDTTrainer):
     """CDTTrainer with info['cost'] replaced by 0.0 for envs without a cost signal."""
 
     @torch.no_grad()
-    def rollout(self, model, env, target_return, target_cost):
+    def rollout(self, model, env, target_return, target_cost, seed=None):
             # >>> CHANGED: cost = 0.0 instead of info["cost"] * self.cost_scale
         states = torch.zeros(1, model.episode_len + 1, model.state_dim,
                              dtype=torch.float, device=self.device)
@@ -603,7 +604,7 @@ class WalkerCDTTrainer(CDTTrainer):
         time_steps = torch.arange(model.episode_len,
                                   dtype=torch.long, device=self.device).view(1, -1)
 
-        obs, info = env.reset()
+        obs, info = env.reset(seed=seed)
         states[:, 0] = torch.as_tensor(obs, device=self.device)
         returns[:, 0] = torch.as_tensor(target_return, device=self.device)
         costs[:, 0] = torch.as_tensor(target_cost, device=self.device)

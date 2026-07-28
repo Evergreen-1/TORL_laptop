@@ -896,6 +896,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                 num_rollouts=10,
                 target_return=4500.0 * reward_scale,
                 target_cost=0.0,
+                seed=seed,
             )
             raw  = mean_ret
             norm = get_normalized_score(raw)
@@ -929,7 +930,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
     video_env = NormObs(video_env)
 
     model.eval()
-    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0)
+    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0, seed=seed)
     video_env.close()
     print("[CDT] Video saved.")
 
