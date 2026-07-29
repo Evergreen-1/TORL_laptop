@@ -97,7 +97,7 @@ def get_args():
     parser.add_argument("--noise",     type=float, default=0.0)
     parser.add_argument("--seed",      type=int,   default=0)
     parser.add_argument("--device",    type=str,   default="cpu")
-    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0") #mujoco/walker2d/medium-v0
+    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0")  #mujoco/walker2d/medium-v0
     parser.add_argument("--dt_steps",  type=int,   default=100_000)
     parser.add_argument("--cql_steps", type=int,   default=1_000_000)
     parser.add_argument("--steps", type=int,   default=100_000)
@@ -791,6 +791,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
 def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
     set_seed(seed)
+    batch_rng = np.random.default_rng(seed)
 
     all_obs    = np.concatenate([t["observations"] for t in traj_list])
     state_mean = all_obs.mean(0, keepdims=True)
@@ -808,9 +809,9 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
     def sample_batch(batch_size):
         S, A, R, C, T, M, EC, Costs = [], [], [], [], [], [], [], []
         for _ in range(batch_size):
-            traj_idx  = np.random.choice(len(traj_list), p=sample_prob)
+            traj_idx  = batch_rng.choice(len(traj_list), p=sample_prob)
             traj      = traj_list[traj_idx]
-            start_idx = random.randint(0, traj["rewards"].shape[0] - 1)
+            start_idx = batch_rng.integers(0, traj["rewards"].shape[0] - 1)
 
             states     = traj["observations"][start_idx : start_idx + seq_len]
             actions    = traj["actions"][start_idx : start_idx + seq_len]
@@ -897,6 +898,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                 num_rollouts=10,
                 target_return=4500.0 * reward_scale,
                 target_cost=0.0,
+                seed=seed,
             )
             raw  = mean_ret
             norm = get_normalized_score(raw)
@@ -930,7 +932,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
     video_env = NormObs(video_env)
 
     model.eval()
-    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0)
+    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0, seed=seed)
     video_env.close()
     print("[CDT] Video saved.")
 
