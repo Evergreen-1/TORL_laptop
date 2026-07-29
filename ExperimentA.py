@@ -12,9 +12,11 @@ Usage:
   python ExperimentA.py --full
 """
 
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import argparse
 import csv
-import os
+
 import random
 import sys
 from collections import defaultdict
@@ -748,7 +750,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
     video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
     video_env = RecordVideo(
         video_base_env, 
-        video_folder=f"videos/dt_seed_{seed}_bestscore_{best_score}", 
+        video_folder=f"videos/deterministic/dt_seed_{seed}_bestscore_{best_score:.2f}", 
         episode_trigger=lambda ep: True,
         disable_logger=True
     )
@@ -944,7 +946,7 @@ def log_result(algo, noise, seed, score):
         w = csv.writer(f)
         if write_header:
             w.writerow(["algo", "noise_fraction", "seed", "normalized_score"])
-        w.writerow([algo + "_test", noise, seed, f"{score:.4f}"])
+        w.writerow([algo + "_rew", noise, seed, f"{score:.4f}"])
     print(f"  → Logged: {algo} | noise={noise:.2f} | seed={seed} | score={score:.2f}")
 
 
@@ -978,12 +980,12 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
         wandb.finish()
       
       
-    wandb.init(project = "Experiment-A",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_debug" + ("_resumed" if checkpoint_path else ""),
+    wandb.init(project = "Experiment-A-Updated",
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_rew" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
-    noise_dict = generate_noise_dict(flat, noise, seed, True, False)
+    noise_dict = generate_noise_dict(flat, noise, seed, False, True)
     noisy_flat  = inject_gaussian_noise(flat,  noise_dict)
     noisy_trajs = inject_noise_into_trajs(trajs, noise_dict)
 
