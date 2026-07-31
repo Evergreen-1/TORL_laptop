@@ -96,12 +96,14 @@ def get_args():
     parser.add_argument("--seed",      type=int,   default=0)
     parser.add_argument("--device",    type=str,   default="cpu")
     parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0")  #mujoco/walker2d/medium-v0
-    parser.add_argument("--dt_steps",  type=int,   default=100_000)
-    parser.add_argument("--cql_steps", type=int,   default=1_000_000)
+    #parser.add_argument("--dt_steps",  type=int,   default=100_000)
+    #parser.add_argument("--cql_steps", type=int,   default=1_000_000)
     parser.add_argument("--steps", type=int,   default=100_000)
     parser.add_argument("--full",      action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)     #loading checkpoint filepath: checkpoints/...
     parser.add_argument("--resume", action="store_true")            #resuming training 
+    parser.add_argument("--obs",    action="store_true")     #Flags for setting noise type
+    parser.add_argument("--rew",    action="store_true")     #Flags for setting noise type
     return parser.parse_args()
 
 
@@ -443,7 +445,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
 
     # Replay buffer
     buf = ReplayBuffer(state_dim, action_dim,
-                       buffer_size=ds["observations"].shape[0] + 100, device=device)
+                       buffer_size=ds["observations"].shape[0] + 100, device=device, seed=seed)
     buf.load_d4rl_dataset(ds)   # same dict format — works unchanged
 
     actor    = TanhGaussianPolicy(state_dim, action_dim, max_action, orthogonal_init=True).to(device)
@@ -496,7 +498,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
     for t in trange(start_step, max_steps, desc="CQL Training"):
         batch = [b.to(device) for b in buf.sample(256)]
         log_cql = trainer.train(batch)
-        if log_cql and isinstance(log_cql, dict):
+        if log_cql and isinstance(log_cql, dict) and (t % 100 ==0):
             wandb.log({f"train/{k}": v for k, v in log_cql.items()}, step=t)
         if (t + 1) % eval_freq == 0:
             raw = eval_gymnasium(actor_fn, eval_env, n_episodes=10, seed=seed, device=device)
@@ -520,8 +522,11 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
                 if hasattr(trainer, "log_alpha"):
                     checkpoint["log_alpha"] = next(trainer.log_alpha.parameters()).clone()
 
-                
-                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_noise_{noise:.2f}_seed_{seed}.pt")
+                #need to determine noise type for checkpoint
+                noise_type = ""
+                if OBS_NOISE: noise_type += "_obs"
+                if REW_NOISE: noise_type += "_rew" 
+                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_noise_{noise:.2f}_seed_{seed}{noise_type}.pt")
                 torch.save(checkpoint, checkpointpath)
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -533,7 +538,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
     
     video_env = RecordVideo(
         video_base_env, 
-        video_folder=f"videos/cql_seed_{seed}_bestscore{best_score}", 
+        video_folder=f"videos/cql_seed_{seed}_bestscore{best_score}_rew_noise_{noise:.2f}", 
         episode_trigger=lambda ep: True,
         disable_logger=True
     )
@@ -969,11 +974,12 @@ NOISE_LEVELS = [0.25, 0.50, 0.75]
 SEEDS        = [1, 2, 3, 4, 5]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
-
+OBS_NOISE    = False
+REW_NOISE    = False 
 
 def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=None):
     print("Experiment A")
-    print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}")
+    print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}  obs={OBS_NOISE}  rew={REW_NOISE}")
     print(f"{'─'*55}")
     
     if wandb.run is not None:
@@ -985,7 +991,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
-    noise_dict = generate_noise_dict(flat, noise, seed, True, False)
+    noise_dict = generate_noise_dict(flat, noise, seed, OBS_NOISE, REW_NOISE)
     noisy_flat  = inject_gaussian_noise(flat,  noise_dict)
     noisy_trajs = inject_noise_into_trajs(trajs, noise_dict)
 
@@ -1003,6 +1009,9 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
 if __name__ == "__main__":
     args   = get_args()
     device = get_device(args.device)
+    OBS_NOISE = args.obs
+    REW_NOISE = args.rew
+
     if args.checkpoint is not None:
         if args.resume:
             print(f"[Harness] Loading historical parameters to resume training perfectly...")
