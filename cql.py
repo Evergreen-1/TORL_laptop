@@ -121,10 +121,12 @@ class ReplayBuffer:
         action_dim: int,
         buffer_size: int,
         device: str = "cpu",
+        seed: int = None,               #Adding determinism
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
         self._size = 0
+        self._seedrng = np.random.default_rng(seed)
 
         self._states = torch.zeros(
             (buffer_size, state_dim), dtype=torch.float32, device=device
@@ -162,7 +164,7 @@ class ReplayBuffer:
         print(f"Dataset size: {n_transitions}")
 
     def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
+        indices = self._seedrng.integers(0, min(self._size, self._pointer), size=batch_size)
         states = self._states[indices]
         actions = self._actions[indices]
         rewards = self._rewards[indices]
