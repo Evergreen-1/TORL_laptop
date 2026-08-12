@@ -8,12 +8,12 @@ Noise:    0%, 25%, 50%, 75% Gaussian injection
 Seeds:    [0, 1, 2, 3, 4]
 
 Usage:
-  python ExperimentA.py --algo dt --device cuda --noise 0.0 --seed 0 --steps 100000 --rew --obs
+  python ExperimentA.py --algo dt --device cuda --noise 0.0 --seed 0 --dt_steps 100000
   python ExperimentA.py --full
 """
 
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+#os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import argparse
 import csv
 
@@ -25,7 +25,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import wandb
-import torch_directml
+#import torch_directml
 
 #dataset
 import minari
@@ -60,24 +60,7 @@ def get_device(requested: str = "auto"):
     Returns a device object (not always a string for DirectML).
     All .to(device) calls in the pipeline accept both strings and device objects.
     """
-    if requested == "directml":
-        
-        if torch_directml.is_available():
-            print(f"[Device] DirectML: {torch_directml.device()}")
-            return torch_directml.device()
-        else:
-            print("[Device] DirectML not available — falling back to CPU.")
-            return "cpu"
-
     if requested == "auto":
-        # Try DirectML first on Windows, then CUDA, then CPU
-        try:
-            if torch_directml.is_available():
-                print(f"[Device] Auto-selected DirectML")
-                return torch_directml.device()
-        except ImportError:
-            pass
-
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
             print(f"[Device] CUDA: {name}")
@@ -106,9 +89,8 @@ def get_args():
     parser.add_argument("--resume", action="store_true")            #resuming training 
     parser.add_argument("--obs",    action="store_true")     #Flags for setting noise type
     parser.add_argument("--rew",    action="store_true")     #Flags for setting noise type
+    parser.add_argument("--record_video", action="store_true")   #Off by default; needs OpenGL/osmesa, not reliable on worker nodes
     return parser.parse_args()
-
-
 
 # SEED MANAGEMENT (similar to dt set seed)
 
@@ -202,8 +184,6 @@ def load_minari_dataset(dataset_id: str):
     print(f"[Minari] {n:,} transitions | {len(traj_list)} episodes loaded.")
     return flat, env, traj_list
 
-
-
 # NOISE INJECTION _______________________________________________________________________________________________
 
 def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_obs: bool = True, noise_rew: bool = True):
@@ -228,7 +208,6 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_o
         "idx_to_rew_noise": dict(zip(idx.tolist(), rew_noise)),
         "idx_set": set(idx.tolist()),
     }
-
 
 def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
     if noise_dict is None:
@@ -278,7 +257,6 @@ def inject_noise_into_trajs(traj_list: list, noise_dict) -> list:
         new_trajs.append(traj)
 
     return new_trajs
-
 
 # EVALUATION HELPER (gymnasium API)
 
@@ -466,9 +444,9 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         actor.train()
         return action
 
-    eval_freq  = max(max_steps // 20, 5_000)
+    eval_freq  = 1000#max(max_steps // 20, 5_000)
 
-    for t in trange(start_step, max_steps, desc="CQL Training"):
+    for t in trange(start_step, max_steps, desc="CQL Training", mininterval=60,miniters=10000):
         batch = [b.to(device) for b in buf.sample(256)]
         log_cql = trainer.train(batch)
         if log_cql and isinstance(log_cql, dict) and (t % 100 ==0):
@@ -506,24 +484,27 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
             wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=t)
 
     #Recording video
-    print("\n[CQL] Recording final evaluation video...")
-    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
-    
-    video_env = RecordVideo(
-        video_base_env, 
-        video_folder=f"videos/cql_seed_{seed}_bestscore{best_score}_rew_noise_{noise:.2f}", 
-        episode_trigger=lambda ep: True,
-        disable_logger=True
-    )
-    video_env = NormWrapper(video_env)
-    obs, _ = video_env.reset(seed=seed)
-    done = False
-    while not done:
-        action = actor_fn(obs, device)
-        obs, reward, terminated, truncated, _ = video_env.step(action)
-        done = terminated or truncated    
-    video_env.close()
-    print("[CQL] Video saved.")
+    if RECORD_VIDEO:
+        print("\n[CQL] Recording final evaluation video...")
+        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        noise_type = "" 
+        if OBS_NOISE: noise_type += "_obs"
+        if REW_NOISE: noise_type += "_rew"
+        video_env = RecordVideo(
+            video_base_env, 
+            video_folder=f"videos/cql_seed_{seed}_bestscore{best_score:.2f}_rew_noise_{noise:.2f}{noise_type}", 
+            episode_trigger=lambda ep: True,
+            disable_logger=True
+        )
+        video_env = NormWrapper(video_env)
+        obs, _ = video_env.reset(seed=seed)
+        done = False
+        while not done:
+            action = actor_fn(obs, device)
+            obs, reward, terminated, truncated, _ = video_env.step(action)
+            done = terminated or truncated    
+        video_env.close()
+        print("[CQL] Video saved.")
 
     return best_score
 
@@ -722,43 +703,44 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
             model.train()
 
     #Recording video
-    print("\n[DT] Recording final evaluation video...")
-    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
-    video_env = RecordVideo(
-        video_base_env, 
-        video_folder=f"videos/deterministic/dt_seed_{seed}_bestscore_{best_score:.2f}", 
-        episode_trigger=lambda ep: True,
-        disable_logger=True
-    )
-    video_env = NormObservation(video_env)
-    video_env = ScaleReward(video_env)
-
-    states = torch.zeros(1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device)
-    actions = torch.zeros(1, model.episode_len, model.action_dim, dtype=torch.float, device=device)
-    returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
-    time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device).view(1, -1)
-
-    obs, _ = video_env.reset(seed=seed)
-    states[:, 0] = torch.as_tensor(obs, device=device)
-    returns[:, 0] = torch.as_tensor(4500.0 * reward_scale, device=device)
-
-    for step in range(model.episode_len):
-        predicted_actions = model(
-            states[:, : step + 1][:, -model.seq_len :],
-            actions[:, : step + 1][:, -model.seq_len :],
-            returns[:, : step + 1][:, -model.seq_len :],
-            time_steps[:, : step + 1][:, -model.seq_len :],
+    if RECORD_VIDEO:
+        print("\n[DT] Recording final evaluation video...")
+        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        video_env = RecordVideo(
+            video_base_env, 
+            video_folder=f"videos/deterministic/dt_seed_{seed}_bestscore_{best_score:.2f}", 
+            episode_trigger=lambda ep: True,
+            disable_logger=True
         )
-        predicted_action = predicted_actions[0, -1].cpu().detach().numpy()
-        next_state, reward, terminated, truncated, _ = video_env.step(predicted_action)
-        actions[:, step] = torch.as_tensor(predicted_action)
-        states[:, step + 1] = torch.as_tensor(next_state)
-        returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
-        if terminated or truncated:
-            break
-
-    video_env.close()
-    print("[DT] Video saved.")
+        video_env = NormObservation(video_env)
+        video_env = ScaleReward(video_env)
+        
+        states = torch.zeros(1, model.episode_len + 1, model.state_dim, dtype=torch.float, device=device)
+        actions = torch.zeros(1, model.episode_len, model.action_dim, dtype=torch.float, device=device)
+        returns = torch.zeros(1, model.episode_len + 1, dtype=torch.float, device=device)
+        time_steps = torch.arange(model.episode_len, dtype=torch.long, device=device).view(1, -1)
+        
+        obs, _ = video_env.reset(seed=seed)
+        states[:, 0] = torch.as_tensor(obs, device=device)
+        returns[:, 0] = torch.as_tensor(4500.0 * reward_scale, device=device)
+        
+        for step in range(model.episode_len):
+            predicted_actions = model(
+                states[:, : step + 1][:, -model.seq_len :],
+                actions[:, : step + 1][:, -model.seq_len :],
+                returns[:, : step + 1][:, -model.seq_len :],
+                time_steps[:, : step + 1][:, -model.seq_len :],
+            )
+            predicted_action = predicted_actions[0, -1].cpu().detach().numpy()
+            next_state, reward, terminated, truncated, _ = video_env.step(predicted_action)
+            actions[:, step] = torch.as_tensor(predicted_action)
+            states[:, step + 1] = torch.as_tensor(next_state)
+            returns[:, step + 1] = torch.as_tensor(returns[:, step] - reward)
+            if terminated or truncated:
+                break
+        
+            video_env.close()
+            print("[DT] Video saved.")
         
     return best_score
 
@@ -896,21 +878,21 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                 print(f"  [CDT]  → Saved checkpoint to {ckpt_path}")
 
             wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
+    if RECORD_VIDEO:
+        print("\n[CDT] Recording final evaluation video...")
+        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        video_env = RecordVideo(
+            video_base_env,
+            video_folder=f"videos/cdt_seed_{seed}_bestscore_{best_score}",
+            episode_trigger=lambda ep: True,
+            disable_logger=True,
+        )
+        video_env = NormObs(video_env)
 
-    print("\n[CDT] Recording final evaluation video...")
-    video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
-    video_env = RecordVideo(
-        video_base_env,
-        video_folder=f"videos/cdt_seed_{seed}_bestscore_{best_score}",
-        episode_trigger=lambda ep: True,
-        disable_logger=True,
-    )
-    video_env = NormObs(video_env)
-
-    model.eval()
-    trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0, seed=seed)
-    video_env.close()
-    print("[CDT] Video saved.")
+        model.eval()
+        trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0, seed=seed)
+        video_env.close()
+        print("[CDT] Video saved.")
 
     return best_score
 
@@ -924,9 +906,8 @@ def log_result(algo, noise, seed, score):
         w = csv.writer(f)
         if write_header:
             w.writerow(["algo", "noise_fraction", "seed", "normalized_score"])
-        w.writerow([algo + "_obs", noise, seed, f"{score:.4f}"])
+        w.writerow([algo + "_rew", noise, seed, f"{score:.4f}"])
     print(f"  → Logged: {algo} | noise={noise:.2f} | seed={seed} | score={score:.2f}")
-
 
 def summarise_results():
     if not os.path.exists(RESULTS_FILE):
@@ -942,25 +923,23 @@ def summarise_results():
         print(f"{algo:<6} {noise:>8}  {np.mean(scores):>8.2f}  {np.std(scores):>8.2f}  {len(scores):>4}")
     print("="*58)
 
-
-NOISE_LEVELS = [0.25]
-SEEDS        = [1,2]
+NOISE_LEVELS = [0.25, 0.50, 0.75]
+SEEDS        = [1, 2, 3, 4, 5]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 OBS_NOISE    = False
-REW_NOISE    = False 
+REW_NOISE    = False
+RECORD_VIDEO = False
 
 def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=None):
     print("Experiment A")
     print(f"  algo={algo}  noise={noise*100:.0f}%  seed={seed}  device={device}  obs={OBS_NOISE}  rew={REW_NOISE}")
-    print(f"{'─'*55}")
     
     if wandb.run is not None:
         wandb.finish()
       
-      
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_rew" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -980,10 +959,13 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
     return score
 
 if __name__ == "__main__":
+    torch.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", 8)))
+    print(f"[Threads] torch using {torch.get_num_threads()} threads (SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')})")
     args   = get_args()
     device = get_device(args.device)
     OBS_NOISE = args.obs
     REW_NOISE = args.rew
+    RECORD_VIDEO = args.record_video
 
     if args.checkpoint is not None:
         if args.resume:

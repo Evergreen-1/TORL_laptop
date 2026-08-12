@@ -781,7 +781,7 @@ class ContinuousCQL:
 
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
-        qf_loss.backward(retain_graph=True)
+        qf_loss.backward(retain_graph=self.cql_lagrange)
         self.critic_1_optimizer.step()
         self.critic_2_optimizer.step()
 
