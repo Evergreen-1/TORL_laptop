@@ -128,7 +128,7 @@ def set_seed(seed: int, env=None):
         env.reset(seed=seed)   # gymnasium API uses reset(seed=) not env.seed()
         env.action_space.seed(seed)
 
-# DATASET LOADING (Minari) _______________________________________________________________________________________________
+# DATASET LOADING (Minari)
 
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
 # These are fixed constants
@@ -229,35 +229,6 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_o
         "idx_set": set(idx.tolist()),
     }
 
-#def inject_gaussian_noise(dataset: dict, noise_fraction: float, seed: int) -> dict:
-    """
-    Adds Gaussian noise to observations and rewards of a random subset of
-    transitions. Uses an isolated RNG so training seeds are unaffected.
-    Noise scale = 0.1 * per-feature std (proportional to data scale).
-    """
-    if noise_fraction == 0.0:
-        print("[Noise] 0% — clean dataset.")
-        return dataset
-
-    rng = np.random.default_rng(seed)
-    dataset = {k: v.copy() for k, v in dataset.items()}
-
-    n = dataset["observations"].shape[0]
-    n_corrupt = int(n * noise_fraction)
-    idx = rng.choice(n, size=n_corrupt, replace=False)
-
-    obs_std = dataset["observations"].std(axis=0)
-    rew_std  = float(dataset["rewards"].std())
-
-    dataset["observations"][idx] += rng.normal(
-        0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])
-    ).astype(np.float32)
-    dataset["rewards"][idx] += rng.normal(
-        0, 0.1 * rew_std, n_corrupt
-    ).astype(np.float32)
-
-    print(f"[Noise] {noise_fraction*100:.0f}% — {n_corrupt:,}/{n:,} transitions corrupted.")
-    return dataset
 
 def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
     if noise_dict is None:
@@ -953,7 +924,7 @@ def log_result(algo, noise, seed, score):
         w = csv.writer(f)
         if write_header:
             w.writerow(["algo", "noise_fraction", "seed", "normalized_score"])
-        w.writerow([algo + "_rew", noise, seed, f"{score:.4f}"])
+        w.writerow([algo + "_obs", noise, seed, f"{score:.4f}"])
     print(f"  → Logged: {algo} | noise={noise:.2f} | seed={seed} | score={score:.2f}")
 
 
@@ -972,8 +943,8 @@ def summarise_results():
     print("="*58)
 
 
-NOISE_LEVELS = [0.25, 0.50, 0.75]
-SEEDS        = [1, 2, 3, 4, 5]
+NOISE_LEVELS = [0.25]
+SEEDS        = [1,2]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 OBS_NOISE    = False
@@ -989,7 +960,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
       
       
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_rew" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
