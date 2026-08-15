@@ -25,7 +25,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 import wandb
-import torch_directml
+#import torch_directml
 
 #dataset
 import minari
@@ -60,14 +60,6 @@ def get_device(requested: str = "auto"):
     Returns a device object (not always a string for DirectML).
     All .to(device) calls in the pipeline accept both strings and device objects.
     """
-    if requested == "directml":
-        
-        if torch_directml.is_available():
-            print(f"[Device] DirectML: {torch_directml.device()}")
-            return torch_directml.device()
-        else:
-            print("[Device] DirectML not available — falling back to CPU.")
-            return "cpu"
 
     if requested == "auto":
         # Try DirectML first on Windows, then CUDA, then CPU
@@ -443,7 +435,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
     #Loading checkpoint if it exists
     if checkpoint_path is not None:
         print(f"[CQL] Loading checkpoint state from: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         actor.load_state_dict(ckpt["actor_state"])
         critic_1.load_state_dict(ckpt["critic_1_state"])
         critic_2.load_state_dict(ckpt["critic_2_state"])
@@ -960,7 +952,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
       
       
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_obs" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_rew" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -988,7 +980,7 @@ if __name__ == "__main__":
     if args.checkpoint is not None:
         if args.resume:
             print(f"[Harness] Loading historical parameters to resume training perfectly...")
-            ckpt = torch.load(args.checkpoint, map_location="cpu")
+            ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
             # Extract and force parameters to preserve absolute dataset identity
             algo = ckpt["algo"]
