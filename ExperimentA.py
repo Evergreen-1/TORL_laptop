@@ -388,6 +388,7 @@ def run_checkpoint_evaluation(checkpoint_path: str, device: str):
 def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int, 
             dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
+    
     set_seed(seed, env)
 
     state_dim  = env.observation_space.shape[0]
@@ -458,7 +459,10 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         actor.train()
         return action
 
-    eval_freq  = max(max_steps // 20, 5_000)
+    if checkpoint_path is not None and "eval_freq" in ckpt:
+        eval_freq = ckpt["eval_freq"]
+    else:
+        eval_freq = max(max_steps // 20, 5_000)
 
     for t in trange(start_step, max_steps, desc="CQL Training"):
         batch = [b.to(device) for b in buf.sample(256)]

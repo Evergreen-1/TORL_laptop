@@ -16,6 +16,7 @@ import os
 #os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import argparse
 import csv
+import gc
 
 import random
 import sys
@@ -80,9 +81,7 @@ def get_args():
     parser.add_argument("--noise",     type=float, default=0.0)
     parser.add_argument("--seed",      type=int,   default=0)
     parser.add_argument("--device",    type=str,   default="cpu")
-    parser.add_argument("--dataset",   type=str,   default="mujoco/walker2d/medium-v0")  #mujoco/walker2d/medium-v0
-    #parser.add_argument("--dt_steps",  type=int,   default=100_000)
-    #parser.add_argument("--cql_steps", type=int,   default=1_000_000)
+    parser.add_argument("--dataset",   type=str,   default="walk")  #mujoco/walker2d/medium-v0 or mujoco/halfcheetah/medium-v0
     parser.add_argument("--steps", type=int,   default=100_000)
     parser.add_argument("--full",      action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)     #loading checkpoint filepath: checkpoints/...
@@ -116,13 +115,18 @@ def set_seed(seed: int, env=None):
 # These are fixed constants
 WALKER2D_REF_MIN = 1.629      # average return of random policy
 WALKER2D_REF_MAX = 4592.3     # average return of expert policy #6992.717
+HALFCHEETAH_REF_MIN = -280.178953
+HALFCHEETAH_REF_MAX = 12135.0
+REF_MIN = 0
+REF_MAX = 0
 
 def get_normalized_score(raw_return: float) -> float:
     """
     D4RL-equivalent normalised score,
     Returns a value in roughly [0, 100], where 100 = expert level.
     """
-    return 100.0 * (raw_return - WALKER2D_REF_MIN) / (WALKER2D_REF_MAX - WALKER2D_REF_MIN)
+    return 100.0 * (raw_return - REF_MIN) / (REF_MAX - REF_MIN)
+
 
 
 def load_minari_dataset(dataset_id: str):
@@ -198,8 +202,8 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_o
     obs_std = dataset["observations"].std(axis=0)
     rew_std = float(dataset["rewards"].std())
 
-    obs_noise = (rng.normal(0, 0.1 * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32) if noise_obs else np.zeros((n_corrupt, dataset["observations"].shape[1]), dtype=np.float32))
-    rew_noise = (rng.normal(0, 0.1 * rew_std, n_corrupt).astype(np.float32) if noise_rew else np.zeros(n_corrupt, dtype=np.float32))
+    obs_noise = (rng.normal(0, NOISE_DEGREE * obs_std, (n_corrupt, dataset["observations"].shape[1])).astype(np.float32) if noise_obs else np.zeros((n_corrupt, dataset["observations"].shape[1]), dtype=np.float32))
+    rew_noise = (rng.normal(0, NOISE_DEGREE * rew_std, n_corrupt).astype(np.float32) if noise_rew else np.zeros(n_corrupt, dtype=np.float32))
 
     print(f"[Noise] {noise_fraction*100:.0f}% corrupted with seed {seed}")
 
@@ -304,7 +308,7 @@ def run_checkpoint_evaluation(checkpoint_path: str, device: str):
 
     print(f"Algorithm: {algo.upper()} with best score {ckpt['best_score']:.2f}")
     
-    base_env = gym.make("Walker2d-v5")
+    base_env = gym.make(VID_ENV)
 
     class NormWrapper(gym.ObservationWrapper):
         def observation(self, obs):
@@ -328,7 +332,7 @@ def run_checkpoint_evaluation(checkpoint_path: str, device: str):
         model.load_state_dict(ckpt["model_state"])
         model.eval()
 
-        target_return = 3000.0 * ckpt["reward_scale"]
+        target_return = T_RETURNS_MAX * ckpt["reward_scale"]
         rets = []
         for ep_i in range(10):
             obs, _ = eval_env.reset(seed=ckpt["seed"] + ep_i)
@@ -374,7 +378,10 @@ def run_checkpoint_evaluation(checkpoint_path: str, device: str):
 def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int, 
             dataset_id: str, noise: float, checkpoint_path: str = None) -> float:
 
-    set_seed(seed, env)
+    if checkpoint_path is None:
+        set_seed(seed, env)
+    gc.disable()          #Perfromance Tuning
+    GC_INTERVAL = 1000     
 
     state_dim  = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -433,6 +440,21 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         if "log_alpha" in ckpt and hasattr(trainer, "log_alpha"):
             with torch.no_grad():
                 next(trainer.log_alpha.parameters()).copy_(ckpt["log_alpha"])
+
+        if "torch_rng_state" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+            np.random.set_state(ckpt["numpy_rng_state"])
+            random.setstate(ckpt["python_rng_state"])
+        else:
+            print("[CQL] WARNING: no RNG state in checkpoint — resume will not be bit-exact.")
+        if "buffer_rng_state" in ckpt:
+            buf._seedrng.bit_generator.state = ckpt["buffer_rng_state"]
+        else:
+            print("[CQL] WARNING: no buffer RNG state in checkpoint — sampling order will differ.")
+
+        # trainer step counter
+        trainer.total_it = ckpt.get("total_it", trainer.total_it)
+
         start_step = ckpt["step"] + 1
         best_score = ckpt.get("best_score", -np.inf)
         print(f"[CQL] Re-entering training loop context at step {start_step:,}")
@@ -444,13 +466,18 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         actor.train()
         return action
 
-    eval_freq  = 1000#max(max_steps // 20, 5_000)
+    if checkpoint_path is not None and "eval_freq" in ckpt:
+        eval_freq = ckpt["eval_freq"]
+    else:
+        eval_freq = max(max_steps // 20, 5_000)
 
-    for t in trange(start_step, max_steps, desc="CQL Training", mininterval=60,miniters=10000):
+    for t in trange(start_step, max_steps, desc="CQL Training", mininterval=300):
         batch = [b.to(device) for b in buf.sample(256)]
         log_cql = trainer.train(batch)
         if log_cql and isinstance(log_cql, dict) and (t % 100 ==0):
             wandb.log({f"train/{k}": v for k, v in log_cql.items()}, step=t)
+        if t % GC_INTERVAL == 0:      # Tuning performance
+            gc.collect()
         if (t + 1) % eval_freq == 0:
             raw = eval_gymnasium(actor_fn, eval_env, n_episodes=10, seed=seed, device=device)
             norm = get_normalized_score(raw)
@@ -466,18 +493,21 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
                 "critic_1_optim_state": trainer.critic_1_optimizer.state_dict(),
                 "critic_2_optim_state": trainer.critic_2_optimizer.state_dict(),
                 "actor_optim_state": trainer.actor_optimizer.state_dict(),
-                "state_mean": state_mean, "state_std": state_std
+                "state_mean": state_mean, "state_std": state_std,
+                "torch_rng_state": torch.get_rng_state(),
+                "numpy_rng_state": np.random.get_state(),
+                "python_rng_state": random.getstate(),
+                "buffer_rng_state": buf._seedrng.bit_generator.state,
+                "total_it": trainer.total_it,
+                "eval_freq": eval_freq,
+                "obs_noise": OBS_NOISE, "rew_noise": REW_NOISE,
                 }
                 if hasattr(trainer, "alpha_optimizer") and trainer.alpha_optimizer is not None:
                     checkpoint["alpha_optim_state"] = trainer.alpha_optimizer.state_dict()
                 if hasattr(trainer, "log_alpha"):
                     checkpoint["log_alpha"] = next(trainer.log_alpha.parameters()).clone()
 
-                #need to determine noise type for checkpoint
-                noise_type = ""
-                if OBS_NOISE: noise_type += "_obs"
-                if REW_NOISE: noise_type += "_rew" 
-                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_noise_{noise:.2f}_seed_{seed}{noise_type}.pt")
+                checkpointpath = os.path.join(CHECKPOINT_DIR, f"cql_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                 torch.save(checkpoint, checkpointpath)
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -486,13 +516,10 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
     #Recording video
     if RECORD_VIDEO:
         print("\n[CQL] Recording final evaluation video...")
-        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
-        noise_type = "" 
-        if OBS_NOISE: noise_type += "_obs"
-        if REW_NOISE: noise_type += "_rew"
+        video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env, 
-            video_folder=f"videos/cql_seed_{seed}_bestscore{best_score:.2f}_rew_noise_{noise:.2f}{noise_type}", 
+            video_folder=f"videos/cql_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
             episode_trigger=lambda ep: True,
             disable_logger=True
         )
@@ -506,6 +533,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         video_env.close()
         print("[CQL] Video saved.")
 
+    gc.enable()
     return best_score
 
 # RUN DT
@@ -572,7 +600,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lambda s: min((s + 1) / 10_000, 1))
 
     eval_freq      = max(update_steps // 10, 10_000)
-    target_returns = (4500.0, 2250.0)  # Standard D4RL testing intervals mapped to Walker2d scale
+    target_returns = (T_RETURNS_MAX, T_RETURNS_MIN)  # Standard D4RL testing intervals mapped to Walker2d scale
     best_score     = -np.inf
     start_step = 0
 
@@ -674,7 +702,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
                 mean_raw_return = float(np.mean(eval_returns))
                 norm = get_normalized_score(mean_raw_return)
                 
-                if target_return == 4500.0:
+                if target_return == T_RETURNS_MAX:
                     print(f"  [DT]  step {step+1:>7,}  target={target_return}  norm_score={norm:.2f}")
 
                     #save checkpoint
@@ -689,7 +717,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
                             "state_mean": state_mean, "state_std": state_std,
                             "seq_len": seq_len, "reward_scale": reward_scale
                         }
-                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_noise_{noise:.2f}_seed_{seed}.pt")
+                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -705,10 +733,10 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
     #Recording video
     if RECORD_VIDEO:
         print("\n[DT] Recording final evaluation video...")
-        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env, 
-            video_folder=f"videos/deterministic/dt_seed_{seed}_bestscore_{best_score:.2f}", 
+            video_folder=f"videos/deterministic/dt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
             episode_trigger=lambda ep: True,
             disable_logger=True
         )
@@ -722,7 +750,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
         
         obs, _ = video_env.reset(seed=seed)
         states[:, 0] = torch.as_tensor(obs, device=device)
-        returns[:, 0] = torch.as_tensor(4500.0 * reward_scale, device=device)
+        returns[:, 0] = torch.as_tensor(T_RETURNS_MAX * reward_scale, device=device)
         
         for step in range(model.episode_len):
             predicted_actions = model(
@@ -739,8 +767,8 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
             if terminated or truncated:
                 break
         
-            video_env.close()
-            print("[DT] Video saved.")
+        video_env.close()
+        print("[DT] Video saved.")
         
     return best_score
 
@@ -854,7 +882,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
         if (step + 1) % eval_freq == 0 or step == update_steps - 1:
             mean_ret, mean_cost, mean_len = trainer.evaluate(
                 num_rollouts=10,
-                target_return=4500.0 * reward_scale,
+                target_return=T_RETURNS_MAX * reward_scale,
                 target_cost=0.0,
                 seed=seed,
             )
@@ -873,24 +901,24 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                     "state_mean": state_mean, "state_std": state_std,
                     "seq_len": seq_len, "reward_scale": reward_scale,
                 }
-                ckpt_path = os.path.join(CHECKPOINT_DIR, f"cdt_noise_{noise:.2f}_seed_{seed}.pt")
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"cdt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                 torch.save(ckpt, ckpt_path)
                 print(f"  [CDT]  → Saved checkpoint to {ckpt_path}")
 
             wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
     if RECORD_VIDEO:
         print("\n[CDT] Recording final evaluation video...")
-        video_base_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env,
-            video_folder=f"videos/cdt_seed_{seed}_bestscore_{best_score}",
+            video_folder=f"videos/cdt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}",
             episode_trigger=lambda ep: True,
             disable_logger=True,
         )
         video_env = NormObs(video_env)
 
         model.eval()
-        trainer.rollout(model, video_env, target_return=4500.0 * reward_scale, target_cost=0.0, seed=seed)
+        trainer.rollout(model, video_env, target_return=T_RETURNS_MAX * reward_scale, target_cost=0.0, seed=seed)
         video_env.close()
         print("[CDT] Video saved.")
 
@@ -906,7 +934,7 @@ def log_result(algo, noise, seed, score):
         w = csv.writer(f)
         if write_header:
             w.writerow(["algo", "noise_fraction", "seed", "normalized_score"])
-        w.writerow([algo + "_rew", noise, seed, f"{score:.4f}"])
+        w.writerow([algo + TAG, noise, seed, f"{score:.4f}"])
     print(f"  → Logged: {algo} | noise={noise:.2f} | seed={seed} | score={score:.2f}")
 
 def summarise_results():
@@ -930,6 +958,12 @@ STEPS_ALGO   = [1000000, 100000]
 OBS_NOISE    = False
 REW_NOISE    = False
 RECORD_VIDEO = False
+NOISE_DEGREE = 0.1
+TAG          = ""       #Used for logging
+DATASET_ID   = ""
+VID_ENV      = ""       #Stores video env name for video recording
+T_RETURNS_MIN= 0        #Target return max
+T_RETURNS_MAX= 0        #Target Return min
 
 def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=None):
     print("Experiment A")
@@ -939,7 +973,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
         wandb.finish()
       
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}_rew" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -959,13 +993,39 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
     return score
 
 if __name__ == "__main__":
-    torch.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", 8)))
+    torch.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", 16)))
+    torch.set_num_interop_threads(1)  # avoid interop thread contention
     print(f"[Threads] torch using {torch.get_num_threads()} threads (SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK')})")
+
     args   = get_args()
     device = get_device(args.device)
     OBS_NOISE = args.obs
     REW_NOISE = args.rew
     RECORD_VIDEO = args.record_video
+    if OBS_NOISE: TAG += "_obs"
+    if REW_NOISE: TAG += "_rew"
+    if (NOISE_DEGREE == 0.5): TAG += "_hard"
+    print(f"[TAG] Wandb logging using tag: {TAG}, with noise degree: {NOISE_DEGREE}")
+    match args.dataset:
+        case "walk":
+            DATASET_ID = "mujoco/walker2d/medium-v0"
+            REF_MAX = WALKER2D_REF_MAX
+            REF_MIN = WALKER2D_REF_MIN
+            VID_ENV = "Walker2d-v5"
+            T_RETURNS_MAX = 4500.0
+            T_RETURNS_MIN = 2250.0
+            TAG += "_Walk"
+        case "halfch":
+            DATASET_ID = "mujoco/halfcheetah/medium-v0"
+            REF_MAX = HALFCHEETAH_REF_MAX
+            REF_MIN = HALFCHEETAH_REF_MIN
+            VID_ENV = "HalfCheetah-v5"
+            T_RETURNS_MAX = 12000.0
+            T_RETURNS_MIN = 6000.0
+            TAG += "_Halfch"
+        case _:
+            sys.exit("[Error] Unexpected dataset was inputed, exiting...")
+    print(f"[Dataset] Training with {DATASET_ID}")
 
     if args.checkpoint is not None:
         if args.resume:
@@ -977,6 +1037,11 @@ if __name__ == "__main__":
             noise = ckpt["noise"]
             seed = ckpt["seed"]
             dataset = ckpt["dataset"]
+            OBS_NOISE = ckpt.get("obs_noise", args.obs)
+            REW_NOISE = ckpt.get("rew_noise", args.rew)
+            if OBS_NOISE: TAG += "_obs"
+            if REW_NOISE: TAG += "_rew"
+            print(f"[TAG] Resume Wandb logging using tag: {TAG}, with noise degree: {NOISE_DEGREE}")
 
             print(f"→ Recovered configuration: ALGO={algo}, NOISE={noise}, SEED={seed}, DATASET={dataset}")
             run_single(algo, noise, seed, dataset, device, args.steps, checkpoint_path=args.checkpoint)
@@ -987,9 +1052,9 @@ if __name__ == "__main__":
         # need algo and steps as well to be set
         for noise in NOISE_LEVELS:
             for seed in SEEDS:
-                run_single(args.algo, noise, seed, args.dataset, args.device, args.steps, checkpoint_path=args.checkpoint)
+                run_single(args.algo, noise, seed, DATASET_ID, args.device, args.steps, checkpoint_path=args.checkpoint)
         summarise_results()
     else:
         run_single(args.algo, args.noise, args.seed,
-                   args.dataset, device, args.steps,checkpoint_path=args.checkpoint)
+                   DATASET_ID, device, args.steps,checkpoint_path=args.checkpoint)
         summarise_results()

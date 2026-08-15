@@ -438,5 +438,7 @@ cql_venv/
 #videos
 videos/
 
-#checkpoints
+#Miscellaneous
 checkpoints/
+HPClogs/
+TestingFiles/
