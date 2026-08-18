@@ -113,10 +113,10 @@ def set_seed(seed: int, env=None):
 
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
 # These are fixed constants
-WALKER2D_REF_MIN = 1.629      # average return of random policy
-WALKER2D_REF_MAX = 4592.3     # average return of expert policy #6992.717
-HALFCHEETAH_REF_MIN = -280.178953
-HALFCHEETAH_REF_MAX = 12135.0
+WALKER2D_REF_MIN = 1.629        # average return of random policy
+WALKER2D_REF_MAX = 4592.3       # average return of expert policy 
+HALFCHEETAH_REF_MIN = 234.63    #-280.178953
+HALFCHEETAH_REF_MAX = 14238.91  #12135.0
 REF_MIN = 0
 REF_MAX = 0
 
@@ -721,13 +721,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
-                wandb.log(
-                    {
-                        f"eval/{target_return}_return_mean": mean_raw_return,
-                        f"eval/{target_return}_normalized_score_mean": norm,
-                    },
-                    step=step,
-                )
+                wandb.log({"eval/raw_return": mean_raw_return, "eval/normalized_score": norm},step=step,)
             model.train()
 
     #Recording video
@@ -973,7 +967,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
         wandb.finish()
       
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}_Updated" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -1012,16 +1006,16 @@ if __name__ == "__main__":
             REF_MAX = WALKER2D_REF_MAX
             REF_MIN = WALKER2D_REF_MIN
             VID_ENV = "Walker2d-v5"
-            T_RETURNS_MAX = 4500.0
-            T_RETURNS_MIN = 2250.0
+            T_RETURNS_MAX = 6200    #5000   4500.0
+            T_RETURNS_MIN = 3100    #2500   2250.0
             TAG += "_Walk"
         case "halfch":
             DATASET_ID = "mujoco/halfcheetah/medium-v0"
             REF_MAX = HALFCHEETAH_REF_MAX
             REF_MIN = HALFCHEETAH_REF_MIN
             VID_ENV = "HalfCheetah-v5"
-            T_RETURNS_MAX = 12000.0
-            T_RETURNS_MIN = 6000.0
+            T_RETURNS_MAX = 14200   #12000.0
+            T_RETURNS_MIN = 7100    #6000.0
             TAG += "_Halfch"
         case _:
             sys.exit("[Error] Unexpected dataset was inputed, exiting...")
