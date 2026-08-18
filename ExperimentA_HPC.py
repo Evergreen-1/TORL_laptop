@@ -13,7 +13,7 @@ Usage:
 """
 
 import os
-#os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import argparse
 import csv
 import gc
@@ -717,7 +717,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
                             "state_mean": state_mean, "state_std": state_std,
                             "seq_len": seq_len, "reward_scale": reward_scale
                         }
-                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"dt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
+                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"5000_dt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
@@ -736,7 +736,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
         video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env, 
-            video_folder=f"videos/deterministic/dt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
+            video_folder=f"videos/5000_Test/dt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
             episode_trigger=lambda ep: True,
             disable_logger=True
         )
@@ -973,7 +973,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
         wandb.finish()
       
     wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
+               name = f"5000_{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
@@ -1012,8 +1012,8 @@ if __name__ == "__main__":
             REF_MAX = WALKER2D_REF_MAX
             REF_MIN = WALKER2D_REF_MIN
             VID_ENV = "Walker2d-v5"
-            T_RETURNS_MAX = 4500.0
-            T_RETURNS_MIN = 2250.0
+            T_RETURNS_MAX = 5000#4500.0
+            T_RETURNS_MIN = 2500#2250.0
             TAG += "_Walk"
         case "halfch":
             DATASET_ID = "mujoco/halfcheetah/medium-v0"
