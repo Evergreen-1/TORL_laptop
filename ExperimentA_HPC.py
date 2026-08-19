@@ -421,7 +421,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         backup_entropy=False, policy_lr=3e-5, qf_lr=3e-4,
         soft_target_update_rate=5e-3, bc_steps=0, target_update_period=1,
         cql_n_actions=10, cql_importance_sample=True, cql_lagrange=False,
-        cql_temp=1.0, cql_alpha=10.0, cql_max_target_backup=False, device=device,
+        cql_temp=1.0, cql_alpha=5.0, cql_max_target_backup=False, device=device,
     )
     start_step = 0
     best_score = -np.inf
@@ -511,7 +511,11 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
                 torch.save(checkpoint, checkpointpath)
                 print(f"  [CQL]  → Saved new best model checkpoint to {checkpointpath}")
 
-            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=t)
+            wandb.log({
+                "eval/raw_return": raw,
+                "eval/normalized_score": norm,
+                "progress": t / max_steps,
+            }, step=t)
 
     #Recording video
     if RECORD_VIDEO:
@@ -684,7 +688,13 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
         optim.step()
         scheduler.step()
 
-        wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
+        #wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/lr": scheduler.get_last_lr()[0],
+            "progress": step / update_steps,
+            "grad_step": step,
+        }, step=step)
 
         # Evaluation phase execution logic built out from TrainConfig steps
         if step % eval_freq == 0 or step == update_steps - 1:
@@ -899,7 +909,13 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                 torch.save(ckpt, ckpt_path)
                 print(f"  [CDT]  → Saved checkpoint to {ckpt_path}")
 
-            wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
+            #wandb.log({"eval/raw_return": raw, "eval/normalized_score": norm}, step=step)
+            wandb.log({
+                "eval/raw_return": raw,
+                "eval/normalized_score": norm,
+                "progress": step / update_steps,
+                "grad_step": step,
+            }, step=step)
     if RECORD_VIDEO:
         print("\n[CDT] Recording final evaluation video...")
         video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
@@ -966,9 +982,9 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
     if wandb.run is not None:
         wandb.finish()
       
-    wandb.init(project = "Experiment-A-Updated",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}_Updated" + ("_resumed" if checkpoint_path else ""),
-               config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps})
+    wandb.init(project = "Experiment-A-Final",
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
+               config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps, "noise_tag": TAG,})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
     noise_dict = generate_noise_dict(flat, noise, seed, OBS_NOISE, REW_NOISE)
