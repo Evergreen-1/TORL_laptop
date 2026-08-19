@@ -113,8 +113,8 @@ def set_seed(seed: int, env=None):
 
 # D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
 # These are fixed constants
-WALKER2D_REF_MIN = 1.629        # average return of random policy
-WALKER2D_REF_MAX = 4592.3       # average return of expert policy 
+WALKER2D_REF_MIN = 0.20         #1.629        # average return of random policy
+WALKER2D_REF_MAX = 6198.90      #4592.3       # average return of expert policy 
 HALFCHEETAH_REF_MIN = 234.63    #-280.178953
 HALFCHEETAH_REF_MAX = 14238.91  #12135.0
 REF_MIN = 0
@@ -945,7 +945,7 @@ def summarise_results():
         print(f"{algo:<6} {noise:>8}  {np.mean(scores):>8.2f}  {np.std(scores):>8.2f}  {len(scores):>4}")
     print("="*58)
 
-NOISE_LEVELS = [0.25, 0.50, 0.75]
+NOISE_LEVELS = [0.0, 0.25, 0.50, 0.75]
 SEEDS        = [1, 2, 3, 4, 5]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
