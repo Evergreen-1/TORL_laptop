@@ -421,7 +421,7 @@ def run_cql(flat_dataset: dict, env, seed: int, device: str, max_steps: int,
         backup_entropy=False, policy_lr=3e-5, qf_lr=3e-4,
         soft_target_update_rate=5e-3, bc_steps=0, target_update_period=1,
         cql_n_actions=10, cql_importance_sample=True, cql_lagrange=False,
-        cql_temp=1.0, cql_alpha=5.0, cql_max_target_backup=False, device=device,
+        cql_temp=1.0, cql_alpha=1.0, cql_max_target_backup=False, device=device,
     )
     start_step = 0
     best_score = -np.inf
@@ -727,11 +727,11 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
                             "state_mean": state_mean, "state_std": state_std,
                             "seq_len": seq_len, "reward_scale": reward_scale
                         }
-                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"5000_dt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
+                        checkpointpath = os.path.join(CHECKPOINT_DIR,f"fin_dt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                         torch.save(checkpoint, checkpointpath)
                         print(f"  [DT]  → Saved new best model checkpoint to {checkpointpath}")
 
-                wandb.log({"eval/raw_return": mean_raw_return, "eval/normalized_score": norm},step=step,)
+                wandb.log({"eval/raw_return": mean_raw_return, "eval/normalized_score": norm, "progress": step / update_steps},step=step,)
             model.train()
 
     #Recording video
@@ -740,7 +740,7 @@ def run_dt(traj_list: list, env, seed: int, device: str, update_steps: int,
         video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env, 
-            video_folder=f"videos/5000_Test/dt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
+            video_folder=f"videos/final/dt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}", 
             episode_trigger=lambda ep: True,
             disable_logger=True
         )
@@ -905,7 +905,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
                     "state_mean": state_mean, "state_std": state_std,
                     "seq_len": seq_len, "reward_scale": reward_scale,
                 }
-                ckpt_path = os.path.join(CHECKPOINT_DIR, f"cdt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
+                ckpt_path = os.path.join(CHECKPOINT_DIR, f"fin_cdt_noise_{noise:.2f}_seed_{seed}{TAG}.pt")
                 torch.save(ckpt, ckpt_path)
                 print(f"  [CDT]  → Saved checkpoint to {ckpt_path}")
 
@@ -921,7 +921,7 @@ def run_cdt(traj_list: list, env, seed: int, device: str, update_steps: int, dat
         video_base_env = gym.make(VID_ENV, render_mode="rgb_array")
         video_env = RecordVideo(
             video_base_env,
-            video_folder=f"videos/cdt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}",
+            video_folder=f"videos/final/cdt_seed_{seed}_noise_{noise:.2f}{TAG}_bestscore_{best_score:.2f}",
             episode_trigger=lambda ep: True,
             disable_logger=True,
         )
@@ -961,8 +961,8 @@ def summarise_results():
         print(f"{algo:<6} {noise:>8}  {np.mean(scores):>8.2f}  {np.std(scores):>8.2f}  {len(scores):>4}")
     print("="*58)
 
-NOISE_LEVELS = [0.0, 0.25, 0.50, 0.75]
-SEEDS        = [1, 2, 3, 4, 5]
+NOISE_LEVELS = [ 0.25, 0.50, 0.75]
+SEEDS        = [1,2,3,4,5]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
 OBS_NOISE    = False
@@ -983,7 +983,7 @@ def run_single(algo, noise, seed, dataset_id, device, steps, checkpoint_path=Non
         wandb.finish()
       
     wandb.init(project = "Experiment-A-Final",
-               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}" + ("_resumed" if checkpoint_path else ""),
+               name = f"{algo}_noise_{noise:.2f}_seed_{seed}{TAG}_200k" + ("_resumed" if checkpoint_path else ""),
                config ={"algo": algo, "noise_level": noise, "seed": seed, "dataset_id": dataset_id, "device": device, "steps": steps, "noise_tag": TAG,})
 
     flat, env, trajs = load_minari_dataset(dataset_id)
