@@ -1,19 +1,28 @@
 """
 Experiment A - Joshua
 
-Dataset:  mujoco/walker2d/medium-v0  (Minari)
-Env:      Walker2d-v5                (gymnasium + mujoco)
+Dataset:  mujoco/walker2d/medium-v0 + mujoco/halfcheetah/medium-v0  (Minari)
+Env:      Walker2d-v5 + HalfCheetah-v5                              (gymnasium + mujoco)
 Algos:    DT, CQL, CDT
 Noise:    0%, 25%, 50%, 75% Gaussian injection
-Seeds:    [0, 1, 2, 3, 4]
+Seeds:    [1, 2, 3, 4, 5]
 
 Usage:
-  python ExperimentA.py --algo dt --device cuda --noise 0.0 --seed 0 --dt_steps 100000
-  python ExperimentA.py --full
+    flags:
+    --record_video  Enables video recording at end of run.
+    --rew or --obs  The noise type you want to have in the dataset. If left out then no noise will be applied.
+    --full          Runs algo with all noise levels and seeds.
+    --checkpoint    Loads a checkpoint file from specified directory and reruns evaluation.
+    --resume        Loads a checkpoint from which you can resume training for X steps.
+                    (X steps is through --steps where X is total steps you want your model to train for)
+    --dataset       Used to specify which dataset you want to run. "walk", "halfch" for Walker2d and HalfCheetah respectively.
+    commands:
+        python ExperimentA_HPC.py --algo dt --device cuda --noise 0.0 --seed 0 --steps 100000 --rew --dataset walk
+        python ExperimentA_HPC.py --full --algo dt --device cuda --steps 100000 --dataset walk
 """
 
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"   #Initialises the env for deterministic cuda use.
 import argparse
 import csv
 import gc
@@ -25,26 +34,25 @@ from collections import defaultdict
 #general algo + logging
 import numpy as np
 import torch
-import wandb
-#import torch_directml
+import wandb 
+import torch.nn as nn
+from torch.nn import functional as F
+from tqdm import trange
 
 #dataset
 import minari
 import gymnasium as gym
 
-#run dt
-import torch.nn as nn
-from torch.nn import functional as F
+#dt (CORL)
 from dt import DecisionTransformer, pad_along_axis
-from tqdm import trange
 
-#cql
+#cql (CORL)
 from cql import TanhGaussianPolicy, FullyConnectedQFunction, ContinuousCQL, ReplayBuffer
 
-#cdt
+#cdt    (Original Paper)
 from cdt import CDT, CDTTrainer, WalkerCDTTrainer
 
-#video of training
+#video recording
 from gymnasium.wrappers import RecordVideo
 
 #checkpoints
@@ -55,12 +63,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 # DEVICE DETECTION
-
 def get_device(requested: str = "auto"):
-    """
-    Returns a device object (not always a string for DirectML).
-    All .to(device) calls in the pipeline accept both strings and device objects.
-    """
+    """Returns a device object. Will default to CPU"""
     if requested == "auto":
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
@@ -70,11 +74,10 @@ def get_device(requested: str = "auto"):
         print("[Device] Using CPU.")
         return "cpu"
 
-    return requested  # explicit "cpu" or "cuda" passed by user
+    return requested  #returns what user specifies.
 
 
 # ARGUMENT PARSING
-
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--algo",      choices=["dt", "cql", "cdt"], default="dt")
@@ -88,11 +91,10 @@ def get_args():
     parser.add_argument("--resume", action="store_true")            #resuming training 
     parser.add_argument("--obs",    action="store_true")     #Flags for setting noise type
     parser.add_argument("--rew",    action="store_true")     #Flags for setting noise type
-    parser.add_argument("--record_video", action="store_true")   #Off by default; needs OpenGL/osmesa, not reliable on worker nodes
+    parser.add_argument("--record_video", action="store_true")   #Off by default, just inputing --record_video sets it to true
     return parser.parse_args()
 
-# SEED MANAGEMENT (similar to dt set seed)
-
+# SEED MANAGEMENT (For reproducability)
 def set_seed(seed: int, env=None):
     random.seed(seed)
     np.random.seed(seed)
@@ -104,47 +106,38 @@ def set_seed(seed: int, env=None):
     try:
         torch.use_deterministic_algorithms(True)
     except Exception as e:
-        print(f"[Determinism] use_deterministic_algorithms failed/unsupported: {e}")
+        print(f"[Determinism] use_deterministic_algorithms failed: {e}")
     if env is not None:
-        env.reset(seed=seed)   # gymnasium API uses reset(seed=) not env.seed()
+        env.reset(seed=seed)  
         env.action_space.seed(seed)
 
 # DATASET LOADING (Minari)
-
-# D4RL reference scores for walker2d normalisation (from d4rl/infos.py)
-# These are fixed constants
+# Dataset fixed constants (Acquired from Datasetverify.py)
 WALKER2D_REF_MIN = 0.20         #1.629        # average return of random policy
-WALKER2D_REF_MAX = 6198.90      #4592.3       # average return of expert policy 
+WALKER2D_REF_MAX = 6198.90      #4592.3       # average return of expert policy
 HALFCHEETAH_REF_MIN = 234.63    #-280.178953
 HALFCHEETAH_REF_MAX = 14238.91  #12135.0
 REF_MIN = 0
 REF_MAX = 0
 
 def get_normalized_score(raw_return: float) -> float:
-    """
-    D4RL-equivalent normalised score,
-    Returns a value in roughly [0, 100], where 100 = expert level.
-    """
+    """D4RL-equivalent normalised score. Returns a value in roughly [0, 100], where 100 = max observed reward in dataset"""
     return 100.0 * (raw_return - REF_MIN) / (REF_MAX - REF_MIN)
 
-
-
 def load_minari_dataset(dataset_id: str):
-    """
-    Downloads (first run) and loads a Minari dataset.
-    Returns:
-      dataset_dict   -flat dict with keys matching D4RL format:
-                      observations, actions, rewards, next_observations, terminals
-      env            -a live gymnasium env recovered from the dataset
-      traj_list      -list of per-episode dicts (for DT/CDT sequence models)
-    """
+    """ Downloads and loads a Minari dataset.
+        Returns:
+            dataset_dict   -flat dict with keys matching D4RL format:
+                            (observations, actions, rewards, next_observations, terminals)
+            env            -a live gymnasium env recovered from the dataset
+            traj_list      -list of per-episode dicts (for DT/CDT sequence models) """
 
 
     print(f"[Minari] Loading '{dataset_id}' ...")
     try:
         ds = minari.load_dataset(dataset_id)
     except Exception:
-        print(f"[Minari] Dataset not cached locally — downloading ...")
+        print(f"[Minari] Dataset not stored locally. Downloading ...")
         minari.download_dataset(dataset_id)
         ds = minari.load_dataset(dataset_id)
 
@@ -160,8 +153,6 @@ def load_minari_dataset(dataset_id: str):
         a   = np.array(ep.actions,           dtype=np.float32)
         r   = np.array(ep.rewards,           dtype=np.float32)
 
-        # terminals: True only if the episode ended by reaching a terminal state
-        # (not a timeout). Minari stores both terminations and truncations.
         terms = np.array(ep.terminations, dtype=np.float32)
 
         obs_list.append(o);  nobs_list.append(no)
@@ -188,9 +179,9 @@ def load_minari_dataset(dataset_id: str):
     print(f"[Minari] {n:,} transitions | {len(traj_list)} episodes loaded.")
     return flat, env, traj_list
 
-# NOISE INJECTION _______________________________________________________________________________________________
-
+# NOISE INJECTION
 def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_obs: bool = True, noise_rew: bool = True):
+    """"Generates a fixed noise pattern array based on the seed such that dataset will be noise will be identical across noise levels and algos"""
     if noise_fraction == 0.0:
         return None
 
@@ -214,6 +205,7 @@ def generate_noise_dict(dataset: dict, noise_fraction: float, seed: int, noise_o
     }
 
 def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
+    """Takes noise pattern (noise_dict) and inject it to dataset"""
     if noise_dict is None:
         print("[Noise] 0% — clean dataset.")
         return dataset
@@ -239,10 +231,7 @@ def inject_gaussian_noise(dataset: dict, noise_dict) -> dict:
     return dataset
 
 def inject_noise_into_trajs(traj_list: list, noise_dict) -> list:
-    """
-    Same noise injection but applied to a trajectory list (for DT/CDT).
-    Operates on the same random indices as inject_gaussian_noise for consistency.
-    """
+    """Same noise injection but applied to a trajectory list (for DT/CDT). Operates on the same random indices as inject_gaussian_noise for consistency."""
     if noise_dict is None:
         return traj_list
 
@@ -262,14 +251,9 @@ def inject_noise_into_trajs(traj_list: list, noise_dict) -> list:
 
     return new_trajs
 
-# EVALUATION HELPER (gymnasium API)
-
+# EVALUATION HELPER (gymnasium API) [TODO]
 def eval_gymnasium(actor_fn, env, n_episodes: int, seed: int, device: str) -> float:
-    """
-    Run n_episodes rollouts using actor_fn(state) -> action.
-    Returns mean raw return (use get_normalized_score() to normalise).
-    Uses gymnasium's reset(seed=) API — no env.seed() call.
-    """
+    """ Run n_episodes rollouts using actor_fn(state) -> action. Returns mean raw return (use get_normalized_score() to normalise). Uses gymnasium's reset(seed=) API — no env.seed() call. """
     returns = []
     for ep_i in range(n_episodes):
         obs, _ = env.reset(seed=seed + ep_i)
@@ -961,7 +945,7 @@ def summarise_results():
         print(f"{algo:<6} {noise:>8}  {np.mean(scores):>8.2f}  {np.std(scores):>8.2f}  {len(scores):>4}")
     print("="*58)
 
-NOISE_LEVELS = [ 0.25, 0.50, 0.75]
+NOISE_LEVELS = [0, 0.25, 0.50, 0.75]
 SEEDS        = [1,2,3,4,5]
 ALGOS        = ["cql", "dt", "cdt"]
 STEPS_ALGO   = [1000000, 100000]
@@ -1022,16 +1006,16 @@ if __name__ == "__main__":
             REF_MAX = WALKER2D_REF_MAX
             REF_MIN = WALKER2D_REF_MIN
             VID_ENV = "Walker2d-v5"
-            T_RETURNS_MAX = 6200    #5000   4500.0
-            T_RETURNS_MIN = 3100    #2500   2250.0
+            T_RETURNS_MAX = 6200    
+            T_RETURNS_MIN = 3100    
             TAG += "_Walk"
         case "halfch":
             DATASET_ID = "mujoco/halfcheetah/medium-v0"
             REF_MAX = HALFCHEETAH_REF_MAX
             REF_MIN = HALFCHEETAH_REF_MIN
             VID_ENV = "HalfCheetah-v5"
-            T_RETURNS_MAX = 14200   #12000.0
-            T_RETURNS_MIN = 7100    #6000.0
+            T_RETURNS_MAX = 14200   
+            T_RETURNS_MIN = 7100   
             TAG += "_Halfch"
         case _:
             sys.exit("[Error] Unexpected dataset was inputed, exiting...")
